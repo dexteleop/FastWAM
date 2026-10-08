@@ -61,11 +61,15 @@ echo "task,num_inference_steps,rtt_ms,pack_ms,send_ms,recv_wait_ms,unpack_ms,ser
 # connection metadata), falling back to a single run against its default instruction.
 if [[ -z "${SWEEP_TASKS:-}" ]]; then
     SWEEP_TASKS="$(
-        "$PYTHON_BIN" - "$HOST" "$PORT" <<'PYEOF' 2>/dev/null || true
+        "$PYTHON_BIN" - "$HOST" "$PORT" "$PROJECT_DIR" <<'PYEOF' 2>/dev/null || true
 import sys
 try:
     import websockets.sync.client
-    from openpi_client import msgpack_numpy
+    try:
+        from openpi_client import msgpack_numpy
+    except ImportError:
+        sys.path.insert(0, f"{sys.argv[3]}/experiments/teleavatar_v2_deploy/server")
+        import openpi_msgpack_numpy as msgpack_numpy
     with websockets.sync.client.connect(
         f"ws://{sys.argv[1]}:{sys.argv[2]}", compression=None, max_size=None
     ) as ws:

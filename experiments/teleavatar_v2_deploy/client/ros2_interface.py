@@ -12,13 +12,24 @@ carries only the LEFT eye of that camera's side-by-side stereo pair.
 
 Server then runs the same compose_ta2_mosaic as training.
 
-State: client still builds raw 72-d observation.state (server slices to 14-d).
-Missing EE/chassis/kinco are zero-filled.
+State: client still builds raw 72-d observation.state (server slices to 14-d,
+or 15-d when the lifting column is modelled). Missing EE/chassis are zero-filled;
+kinco (index 71) is filled from `lift.state_topic` when configured.
 
-Actions from server are 16-d denormalized:
-  [L_arm(7), L_grip_effort, R_arm(7), R_grip_effort]
+Actions from server are 16-d or 17-d denormalized:
+  16-d: [L_arm(7), L_grip_effort, R_arm(7), R_grip_effort]
+  17-d: the above + lift velocity command (models trained with `lift=on`)
   policy-rate arm targets -> interpolation-rate joint_cmd;
-  grip efforts -> latest trigger target via TA2 curve.
+  grip efforts -> latest trigger target via TA2 curve;
+  lift command -> /api/servo/cmd, normalized by `lift.cmd_scale`/`lift.cmd_sign`
+  and republished by its own keep-alive timer (the servo disables itself after
+  3 s of silence and does not use the FSM heartbeat, so it cannot ride on the
+  arm command path).
+
+Lift sign convention (verified, see arm_config.yml for the evidence):
+  dataset action[16] is a motor-side speed; §4.6 defines motor speed as
+  -normalized_velocity * 150, so a POSITIVE raw command means DESCEND and the
+  published normalized velocity is negated.
 """
 
 from __future__ import annotations
@@ -33,7 +44,7 @@ import yaml
 from geometry_msgs.msg import Pose
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Float32
+from std_msgs.msg import Float32, Float32MultiArray
 
 from rtp_video_interface import RTPH265VideoInterface
 from fastwam_rosbag_bridge import FastWamBagPublisher
@@ -77,6 +88,9 @@ class TeleavatarROS2Interface(Node):
         interpolate: bool = True,
         sensor_timeout: float = 1.0,
         arm_config_path: Optional[pathlib.Path] = None,
+        lift_dry_run: bool = False,
+        lift_enabled: Optional[bool] = None,
+        lift_state_consumed: bool = False,
     ):
         print("[client] ROS Node.__init__ ...", flush=True)
         super().__init__(node_name)
@@ -126,6 +140,47 @@ class TeleavatarROS2Interface(Node):
         self.latest_chassis: Optional[JointState] = None
         self.chassis_timestamp: float = 0.0
 
+        # ---- lifting column (kinco) -------------------------------------- #
+        # Everything here stays inert for 16-d models; it only wakes up once a
+        # 17-d action arrives.
+        lift_cfg = arm_config.get("lift") or {}
+        self._lift_cmd_scale = float(lift_cfg.get("cmd_scale", 150.0))
+        if self._lift_cmd_scale <= 0.0:
+            raise ValueError(f"lift.cmd_scale must be > 0, got {self._lift_cmd_scale}")
+        # Dataset records motor-side target speed, /api/servo/cmd takes the
+        # normalized side, and per §4.6 they differ by a sign. See arm_config.yml.
+        self._lift_cmd_sign = float(lift_cfg.get("cmd_sign", -1.0))
+        if self._lift_cmd_sign not in (1.0, -1.0):
+            raise ValueError(f"lift.cmd_sign must be +1.0 or -1.0, got {self._lift_cmd_sign}")
+        self._lift_max_norm = float(lift_cfg.get("max_normalized_velocity", 1.0))
+        self._lift_max_norm = float(np.clip(self._lift_max_norm, 0.0, 1.0))
+        self._lift_state_topic = lift_cfg.get("state_topic") or None
+        self._lift_state_msg_type = str(lift_cfg.get("state_msg_type") or "sensor_msgs/msg/JointState")
+        self._lift_state_field = str(lift_cfg.get("state_field") or "velocity")
+        self._lift_state_index = int(lift_cfg.get("state_index") or 0)
+        self._lift_dry_run = bool(lift_dry_run)
+        # None = follow the action width (legacy behaviour: any 17-d action drives the
+        # column). False = never drive it, even for a 17-d policy. Set from the server's
+        # `lift_enabled` metadata or --lift-mode.
+        self._lift_allowed = lift_enabled
+        # Whether the served model actually takes the lift measured velocity as input.
+        # Only then is pinning raw state[71] to 0 a train/deploy mismatch worth warning about.
+        self._lift_state_consumed = bool(lift_state_consumed)
+
+        self._lift_lock = Lock()
+        self._lift_target_norm = 0.0     # normalized velocity currently commanded
+        self._lift_have_target = False
+        self._lift_active = False        # flips on the first 17-d action
+        self._lift_timer = None
+        self.latest_lift_velocity: float = 0.0
+        self.lift_state_timestamp: float = 0.0
+        self._lift_warned_no_state = False
+        self._lift_disabled_logged = False
+        # The servo decelerates and disables itself after ~3 s without a command,
+        # so the target has to be republished well inside that window. 20 Hz is
+        # the same rate the arms get and is far below the 3 s deadline.
+        self._lift_period = 1.0 / 20.0
+
         self.left_joint_names = [f"l_joint{i}" for i in range(1, 8)]
         self.right_joint_names = [f"r_joint{i}" for i in range(1, 8)]
 
@@ -172,6 +227,31 @@ class TeleavatarROS2Interface(Node):
         self.create_subscription(Pose, "/left_arm/current_ee_pose", lambda m: self._ee_cb(m, "left"), 10)
         self.create_subscription(Pose, "/right_arm/current_ee_pose", lambda m: self._ee_cb(m, "right"), 10)
 
+        # Lifting-column measured velocity -> raw state[71]. Optional: the topic is
+        # not part of the published §4.1 interface table, so it has to be named in
+        # arm_config.yml. Without it state[71] stays 0, which is a known mismatch
+        # against training (where it carries the real measured velocity).
+        if self._lift_state_topic:
+            msg_type = self._lift_state_msg_type.strip().lower()
+            if "float32multiarray" in msg_type:
+                self.create_subscription(
+                    Float32MultiArray, self._lift_state_topic, self._lift_state_array_cb, 10
+                )
+            elif "jointstate" in msg_type:
+                self.create_subscription(
+                    JointState, self._lift_state_topic, self._lift_state_js_cb, 10
+                )
+            else:
+                raise ValueError(
+                    f"Unsupported lift.state_msg_type={self._lift_state_msg_type!r}. "
+                    "Expected sensor_msgs/msg/JointState or std_msgs/msg/Float32MultiArray."
+                )
+            self.logger.info(
+                f"Lift state subscribed: {self._lift_state_topic} "
+                f"({self._lift_state_msg_type}, field={self._lift_state_field}, "
+                f"index={self._lift_state_index})"
+            )
+
     def _setup_publishers(self) -> None:
         self.pubs = {
             # TA2 API mode consumes commands below /api; joint_states remain
@@ -182,6 +262,10 @@ class TeleavatarROS2Interface(Node):
             "right_gripper": self.create_publisher(Float32, "/api/right_gripper/cmd", 10),
         }
         self.enable_pub = self.create_publisher(Float32, "/api/fsm/enable", 10)
+        # data = [normalized_velocity, enable]. Created unconditionally so the
+        # subscriber count shows up in the startup health check, but nothing is
+        # published until a 17-d action arrives.
+        self.servo_pub = self.create_publisher(Float32MultiArray, "/api/servo/cmd", 10)
 
     def _js_cb(self, msg: JointState, key: str) -> None:
         with self.lock:
@@ -202,6 +286,21 @@ class TeleavatarROS2Interface(Node):
         with self.lock:
             self.latest_ee[key] = msg
             self.ee_timestamps[key] = time.time()
+
+    def _store_lift_state(self, value: float) -> None:
+        with self.lock:
+            self.latest_lift_velocity = float(value)
+            self.lift_state_timestamp = time.time()
+
+    def _lift_state_js_cb(self, msg: JointState) -> None:
+        data = list(getattr(msg, self._lift_state_field, []) or [])
+        if self._lift_state_index < len(data):
+            self._store_lift_state(data[self._lift_state_index])
+
+    def _lift_state_array_cb(self, msg: Float32MultiArray) -> None:
+        data = list(msg.data or [])
+        if self._lift_state_index < len(data):
+            self._store_lift_state(data[self._lift_state_index])
 
     def destroy_node(self) -> None:
         try:
@@ -252,6 +351,7 @@ class TeleavatarROS2Interface(Node):
         publishers = {
             **self.pubs,
             "enable": self.enable_pub,
+            "servo": self.servo_pub,
         }
         counts = {
             name: publisher.get_subscription_count()
@@ -262,7 +362,7 @@ class TeleavatarROS2Interface(Node):
             f"left_arm={counts['left_arm']} right_arm={counts['right_arm']} "
             f"left_gripper={counts['left_gripper']} "
             f"right_gripper={counts['right_gripper']} "
-            f"enable={counts['enable']}"
+            f"enable={counts['enable']} servo={counts['servo']}"
         )
         if counts["left_arm"] == 0 or counts["right_arm"] == 0:
             self.logger.warning(
@@ -302,6 +402,8 @@ class TeleavatarROS2Interface(Node):
             chassis = self.latest_chassis
             lee = self.latest_ee.get("left")
             ree = self.latest_ee.get("right")
+            lift_vel = self.latest_lift_velocity
+            lift_ts = self.lift_state_timestamp
 
         state = np.zeros(72, dtype=np.float32)
         # positions 0-15
@@ -331,7 +433,34 @@ class TeleavatarROS2Interface(Node):
             state[62:65] = self._field(chassis, "position", 3)
             state[65:68] = self._field(chassis, "velocity", 3)
             state[68:71] = self._field(chassis, "effort", 3)
-        # kinco 71 left 0
+        # kinco 71: lifting-column measured velocity. Stays 0 when no state topic is
+        # configured -- see arm_config.yml `lift.state_topic`. Training saw a live
+        # signal here, so a constant 0 is a real train/deploy mismatch; warn once
+        # rather than letting it pass silently.
+        if self._lift_state_topic:
+            if lift_ts > 0.0:
+                state[71] = lift_vel
+            elif not self._lift_warned_no_state:
+                self._lift_warned_no_state = True
+                self.logger.warning(
+                    f"No message yet on lift state topic {self._lift_state_topic}; "
+                    "state[71] is 0 and does not match training."
+                )
+        elif (
+            self._lift_state_consumed
+            and self._lift_active
+            and not self._lift_warned_no_state
+        ):
+            # Only a mismatch when the served model actually reads this channel. Models
+            # trained with `lift=on` use a 14-d state (lift command out, no lift feedback
+            # in), so the constant 0 here is simply unused -- warning would be noise.
+            self._lift_warned_no_state = True
+            self.logger.warning(
+                "Policy consumes the lift measured velocity but lift.state_topic is unset: "
+                "state[71] is pinned to 0 while training saw the live signal. Expect "
+                "degraded lift behaviour. Retrain with `lift=on` (action 17-d / state 14-d) "
+                "to remove this dependency -- §4.8 lists no public lift state topic."
+            )
         return state
 
     def _bag_image_source(
@@ -414,19 +543,37 @@ class TeleavatarROS2Interface(Node):
         action: np.ndarray,
         ramp_duration: Optional[float] = None,
     ) -> None:
-        """Set one 16-d policy action as the latest actuator target.
+        """Set one policy action as the latest actuator target.
+
+        Accepts 16-d [L_arm(7), L_grip, R_arm(7), R_grip] or 17-d with a trailing
+        lifting-column velocity command (models trained with `lift=on`). A 17-d
+        action is served with the column disabled when `lift_enabled=False`.
 
         Arms ramp from the last published position to the new target over one
         policy period and are republished by the interpolation timer. Grippers
         are not interpolated; the timer republishes the latest effort target.
+        The lift command goes out on its own keep-alive timer.
         """
         a = np.asarray(action, dtype=np.float32).reshape(-1)
-        if a.shape != (16,):
-            self.logger.error(f"expected action shape (16,), got {a.shape}")
+        if a.shape not in {(16,), (17,)}:
+            self.logger.error(f"expected action shape (16,) or (17,), got {a.shape}")
             return
 
         arm14 = np.concatenate([a[0:7], a[8:15]]).astype(np.float64)
         grip2 = np.asarray([a[7], a[15]], dtype=np.float64)
+        if a.shape == (17,):
+            if self._lift_allowed is False:
+                # 17-d policy served with the column deliberately disabled: drop the
+                # channel rather than publishing it. Never touches /api/servo/cmd, so
+                # the servo stays idle and disables itself after its own 3 s timeout.
+                if not self._lift_disabled_logged:
+                    self._lift_disabled_logged = True
+                    self.logger.info(
+                        "Lift disabled for this session: dropping action[16] "
+                        "(17-d policy, lift_enabled=False). /api/servo/cmd is not published."
+                    )
+            else:
+                self._set_lift_target(float(a[16]))
         if not self._interpolate:
             self._publish_cmd(arm14, grip2)
             return
@@ -445,6 +592,87 @@ class TeleavatarROS2Interface(Node):
             )
             self._gripper_target = grip2
             self._have_target = True
+
+    def _set_lift_target(self, raw_cmd: float) -> None:
+        """Latch one lifting-column velocity command (raw dataset units).
+
+        Raw commands are motor-side target speeds saturating at +/-`lift.cmd_scale`
+        (150 rad/s in the training data). `/api/servo/cmd` wants a normalized
+        velocity in [-1, 1] on the opposite sign convention (§4.6: motor speed =
+        -normalized * 150), hence `lift.cmd_sign`.
+        """
+        raw = float(raw_cmd)
+        # §4.6 requires two finite values. np.clip propagates NaN, so a non-finite
+        # prediction would otherwise reach the servo as NaN.
+        if not np.isfinite(raw):
+            self.logger.error(
+                f"non-finite lift command ({raw}); holding previous target",
+            )
+            return
+
+        norm = self._lift_cmd_sign * raw / self._lift_cmd_scale
+        norm = float(np.clip(norm, -self._lift_max_norm, self._lift_max_norm))
+
+        first = False
+        with self._lift_lock:
+            if not self._lift_active:
+                self._lift_active = True
+                first = True
+            self._lift_target_norm = norm
+            self._lift_have_target = True
+
+        if first:
+            self.logger.info(
+                f"17-d action detected: lifting column ENGAGED "
+                f"(cmd_scale={self._lift_cmd_scale:g}, cmd_sign={self._lift_cmd_sign:+g}, "
+                f"max_normalized_velocity={self._lift_max_norm:g}, "
+                f"dry_run={self._lift_dry_run}). "
+                f"Positive raw command => "
+                f"{'DOWN' if self._lift_cmd_sign < 0 else 'UP'}"
+            )
+            if self._lift_timer is None and not self._lift_dry_run:
+                self._lift_timer = self.create_timer(self._lift_period, self._lift_publish)
+
+        if self._lift_dry_run:
+            self.logger.info(f"[lift dry-run] raw={raw_cmd:+.2f} -> normalized={norm:+.4f}")
+
+    def _lift_publish(self) -> None:
+        """Republish the latest lift target; the servo disables after ~3 s of silence."""
+        # Enforced here as well as at timer creation: dry-run must mean "the column
+        # never receives a command", regardless of who calls this.
+        if self._lift_dry_run:
+            return
+        with self._publish_lock:
+            if self._command_stream_stopped:
+                return
+            with self._lift_lock:
+                if not self._lift_have_target:
+                    return
+                norm = self._lift_target_norm
+            msg = Float32MultiArray()
+            msg.data = [float(norm), 1.0]  # [normalized_velocity, enable]
+            self.servo_pub.publish(msg)
+
+    def _stop_lift(self) -> None:
+        """Zero the lift velocity and drop enable, then stop republishing.
+
+        Sent before the arms are disabled so the column does not coast on the
+        last non-zero target while the rest of the robot is shutting down.
+        """
+        if self._lift_timer is not None:
+            self._lift_timer.cancel()
+            self._lift_timer = None
+        with self._lift_lock:
+            was_active = self._lift_active
+            self._lift_target_norm = 0.0
+            self._lift_have_target = False
+        if not was_active or self._lift_dry_run:
+            return
+        msg = Float32MultiArray()
+        msg.data = [0.0, 0.0]
+        for _ in range(3):  # UDP-ish transport: a dropped stop command matters
+            self.servo_pub.publish(msg)
+        self.logger.info("Lift stop published (velocity=0, enable=0)")
 
     def _current_arm_positions(self) -> Optional[np.ndarray]:
         with self.lock:
@@ -540,6 +768,10 @@ class TeleavatarROS2Interface(Node):
             self._interp_timer.cancel()
         with self._cmd_lock:
             self._have_target = False
+        # Zero the column before the stopped-flag gate closes: _stop_lift clears
+        # the target first, so an in-flight _lift_publish bails out instead of
+        # racing a stale non-zero velocity past our stop command.
+        self._stop_lift()
         # Drain an in-flight timer callback before the caller publishes enable=0.
         with self._publish_lock:
             self._command_stream_stopped = True

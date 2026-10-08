@@ -14,12 +14,17 @@
 #   DATASET_STATS  explicit stats path. Default: $RUN/dataset_stats.json.
 #   TASK_MAP       taskmap.json path; skipped if absent.
 #   PROMPT_TASK    startup instruction; resolved from the dataset meta if unset.
+#   TEXT_EMBED     precomputed T5 context .pt for the startup instruction; skips the
+#                  lookup. Use it on a deploy machine that has the embeds but not the
+#                  datasets, when the exact instruction text is not at hand.
+#   CONFIG_OVERRIDES  space-separated hydra overrides, each passed as --config-override,
+#                  e.g. "lift=legacy" for a pre-split 17/15 checkpoint.
 #   PROJECT_ROOT   repo root. Default: this script's directory.
 #   PYTHON_BIN     interpreter. Default: python.
 #   HOST / PORT    listen address. Default: 0.0.0.0 / 8000.
 #
-# Only one server per host: port 8000 is fixed and two processes would contend for it
-# and for the GPU.
+# One server per GPU: each holds ~14 GB of GPU memory, so a second one does not fit on a
+# 24 GB card even on another PORT.
 
 set -euo pipefail
 
@@ -44,7 +49,9 @@ TASK="${TASK:?required: TASK=<config name under configs/task/, without .yaml>}"
 }
 
 # ---- locate the run --------------------------------------------------------- #
-if [[ -z "${RUN:-}" ]]; then
+# Only needed to derive a path that was not given: with both CHECKPOINT and
+# DATASET_STATS set there is no run directory to find (e.g. a deploy machine).
+if [[ -z "${RUN:-}" && ( -z "${CHECKPOINT:-}" || -z "${DATASET_STATS:-}" ) ]]; then
   RUN="$(ls -td "runs/$TASK"/*/ 2>/dev/null | head -1 || true)"
   RUN="${RUN%/}"
   [[ -n "$RUN" ]] || {
@@ -85,6 +92,13 @@ fi
 if [[ -n "${PROMPT_TASK:-}" ]]; then
   EXTRA+=(--prompt-task "$PROMPT_TASK")
 fi
+if [[ -n "${TEXT_EMBED:-}" ]]; then
+  [[ -f "$TEXT_EMBED" ]] || { echo "text embed not found: $TEXT_EMBED" >&2; exit 1; }
+  EXTRA+=(--text-embed "$TEXT_EMBED")
+fi
+for ov in ${CONFIG_OVERRIDES:-}; do
+  EXTRA+=(--config-override "$ov")
+done
 
 echo "================================================"
 echo "FastWAM inference server (WebSocket)"
@@ -95,9 +109,10 @@ echo "Dataset stats: $DATASET_STATS"
 echo "Listening:     ws://$HOST:$PORT"
 echo "Health:        http://$HOST:$PORT/healthz   (/healthz, not /health)"
 echo "Denoise steps: $NUM_STEPS"
+[[ -n "${CONFIG_OVERRIDES:-}" ]] && echo "Overrides:     $CONFIG_OVERRIDES"
 echo "CUDA Graph warmup: 8 10 12"
 echo "================================================"
-echo "Wait for 'WebSocket server listening on ws://$HOST:$PORT' before starting the client"
+echo "Model loads first (~2 min). Ready once http://$HOST:$PORT/healthz answers OK"
 echo "================================================"
 
 exec "$PYTHON_BIN" experiments/teleavatar_v2_deploy/server/serve_policy_ws.py \

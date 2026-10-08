@@ -114,9 +114,14 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         import websockets.sync.client
-        from openpi_client import msgpack_numpy
+        try:
+            from openpi_client import msgpack_numpy
+        except ImportError:
+            # Same module, vendored next to the server (see openpi_msgpack_numpy.py).
+            sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "server"))
+            import openpi_msgpack_numpy as msgpack_numpy
     except ImportError:
-        print("websockets/msgpack/openpi_client missing. Run with the fastwam interpreter:\n"
+        print("websockets/msgpack missing. Run with the fastwam interpreter:\n"
               "  python bench_infer_ws.py ...",
               file=sys.stderr)
         return 1

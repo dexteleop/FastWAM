@@ -1161,7 +1161,13 @@ class FastWAM(torch.nn.Module):
             payload["optimizer"] = optimizer.state_dict()
         torch.save(payload, path)
 
-    def load_checkpoint(self, path, optimizer=None):
+    def load_checkpoint(self, path, optimizer=None, *, require_full_coverage: bool = False):
+        """Restore training weights, optionally requiring every MoT/proprio tensor.
+
+        Deployment skips pretrained expert loading and therefore requires full coverage.
+        VAE and text encoder weights are loaded separately, outside this checkpoint.
+        The default still permits legacy video-only and partial MoT checkpoints.
+        """
         # `mmap=True` pages tensors in as they are copied to the GPU instead of reading the whole
         # ~11 GiB payload into anonymous memory first (measured 11.8 -> ~0 GiB host RSS, 11.2s ->
         # 2.1s). Older checkpoints written with the legacy serialization cannot be mmapped, so
@@ -1171,6 +1177,25 @@ class FastWAM(torch.nn.Module):
         except (RuntimeError, ValueError) as exc:
             logger.info("mmap load unavailable for %s (%s); falling back to a full read.", path, exc)
             payload = torch.load(path, map_location="cpu")
+        if require_full_coverage:
+            required_modules = {"mot": self.mot}
+            if self.proprio_encoder is not None:
+                required_modules["proprio_encoder"] = self.proprio_encoder
+            # Check all required sections before copying weights into the model. A legacy
+            # `dit` section cannot cover the action expert when pretrained loading was skipped.
+            for name, module in required_modules.items():
+                if name not in payload:
+                    raise RuntimeError(
+                        f"Full checkpoint coverage requires `{name}` weights, but they are "
+                        f"missing from {path}. Use a complete checkpoint for this model."
+                    )
+                missing = sorted(set(module.state_dict()) - set(payload[name]))
+                if missing:
+                    raise RuntimeError(
+                        f"Full checkpoint coverage failed: {len(missing)} `{name}` tensor(s) "
+                        f"are missing from {path}: {missing[:10]}. "
+                        "Use a complete checkpoint for this model."
+                    )
         # When the video expert was allocated uninitialized, any tensor the checkpoint does not
         # supply holds undefined memory rather than a random-but-valid init, so it must not be
         # left unloaded.

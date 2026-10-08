@@ -9,9 +9,10 @@
 # the WebSocket client does not emit them, so they stay empty.
 #
 # Usage: bash record_fastwam_bag.sh [output_dir]
+#   output_dir defaults to $BAG_ROOT, else $HOME/fastwam_bags (same as run_task_ws.sh).
 set -euo pipefail
 
-OUT_DIR="${1:-$HOME/FastWAM_TA2/lusiwei/fastwam_bags}"
+OUT_DIR="${1:-${BAG_ROOT:-$HOME/fastwam_bags}}"
 mkdir -p "${OUT_DIR}"
 cd "${OUT_DIR}"
 

@@ -18,6 +18,9 @@
 # Resume and LR anneal need no separate config; override on the command line. See docs/GUIDE.md.
 
 defaults:
+  # Lifting-column mode; sets the action/state widths (see configs/lift/). Use "on" only
+  # if the dataset actually moves the column. Must precede the `override` entries.
+  - /lift: "off"
   - override /data: ta2_mono_template   # <- your data config name
   - override /model: fastwam
   - _self_

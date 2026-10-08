@@ -76,6 +76,7 @@ pip install -U pip
 pip install torch==2.7.1+cu128 torchvision==0.22.1+cu128 \
   --extra-index-url https://download.pytorch.org/whl/cu128
 pip install -e .
+pip install -e ".[analysis]"   # optional: the rosbag / plotting tools under Analysis tools
 ```
 
 Then pre-generate the ActionDiT backbone once (it is interpolated from the Wan2.2 DiT, not
@@ -93,6 +94,9 @@ python scripts/preprocess_action_dit_backbone.py \
 
 `DIFFSYNTH_MODEL_BASE_PATH` must be set for every training and serving process — the Wan
 component loader resolves all model paths relative to it.
+
+This step and the text-embedding precompute below both fit in 15 GB of host RAM (measured
+under a cgroup cap on a 32 GB / RTX 4090 box), so a workstation can run them.
 
 The robot-side client has a different, much lighter dependency set and **must** run on the
 system interpreter, because ROS 2 Humble's C extensions are built for it. See
@@ -241,6 +245,17 @@ starting the client. Health check: `curl http://<host>:8000/healthz`.
 and model dimensions from it, so a mismatch fails at load time (by design; it used to fail
 much later and less clearly).
 
+A deploy machine usually has the text embeds but not the datasets, so the startup
+instruction cannot be read from `meta/tasks.jsonl`. In that case pass the embed directly. A
+checkpoint whose lift mode differs from the task default takes `CONFIG_OVERRIDES`:
+
+```bash
+TASK=<your_task> TEXT_EMBED=data/text_embeds_cache/<task>/<sha256>.t5_len128.wan22ti2v5b.pt \
+  bash start_local_serve_ws.sh 10
+TASK=<your_task> CONFIG_OVERRIDES="lift=legacy" TEXT_EMBED=... \
+  bash start_local_serve_ws.sh 10      # pre-split 17/15 run
+```
+
 ### Optional — a task library for switching instructions
 
 To select among several instructions by short name at runtime, generate a task map:
@@ -289,22 +304,20 @@ A checkpoint alone is not servable. These must travel together, from the **same 
 The DiT shards (19 GB), ActionDiT payload (2 GB) and T5 encoder (11 GB) do **not** need to be
 copied — serving sets `skip_dit_load_from_pretrain=True` and reads cached text embeddings.
 
-Two scripts move exactly that set via KS3:
+Copy them with whatever moves files between your machines, keeping the repo-relative layout
+so that `start_local_serve_ws.sh` finds the newest run and highest step on its own. For
+example, from the repo root on the training server:
 
 ```bash
-# on the training server (internal endpoint)
-TASK=<task> RUN_ID=<run_id> STEP=step_<N>.pt \
-  KS3_BUCKET=ks3://<bucket>/<prefix> \
-  bash push_checkpoint_ks3.sh
-
-# on the deploy machine (public endpoint) -- same three values
-TASK=<task> RUN_ID=<run_id> STEP=step_<N>.pt \
-  KS3_BUCKET=ks3://<bucket>/<prefix> PROJECT_ROOT=/path/to/FastWAM \
-  bash pull_checkpoint.sh
+rsync -aR runs/<task>/<RUN_ID>/dataset_stats.json runs/<task>/<RUN_ID>/config.yaml \
+  runs/<task>/<RUN_ID>/checkpoints/weights/step_<N>.pt \
+  data/text_embeds_cache/<task>/ \
+  checkpoints/DiffSynth-Studio/Wan-Series-Converted-Safetensors/Wan2.2_VAE.safetensors \
+  <deploy-host>:/path/to/FastWAM/
 ```
 
-The pull script stages incoming `configs/` in `configs_incoming_<RUN_ID>/` rather than
-overwriting yours, and prints a diff for you to merge.
+`config.yaml` is provenance only; serving rebuilds the model from `configs/task/<task>.yaml`,
+which must match the one used for training.
 
 ---
 
@@ -351,7 +364,13 @@ raw 72-d:  positions[0:16]  = [L_arm(7), L_grip_pos, R_arm(7), R_grip_pos]
 
 model:     state  14-d = [L_arm(7), R_arm(7)]
            action 16-d = [L_arm(7), L_grip, R_arm(7), R_grip]
+           action 17-d = the above + lifting-column command (lift=on)
 ```
+
+The lifting column is a hydra config group, `lift=off|on` (`configs/lift/`), chosen in the
+task config's defaults. `lift=on` adds the lift command to the action but never feeds the
+measured velocity back as state, because no lift state topic exists at deploy time. See
+[docs/GUIDE.md](./docs/GUIDE.md#the-lifting-column-liftoffon).
 
 Gripper channels are **force**-controlled: the dataset stores effort in N·m, converted to a
 platform trigger in [0, 1] before normalization and converted back on the robot side.

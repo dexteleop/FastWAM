@@ -129,6 +129,39 @@ def _instruction_from_dataset(dataset_dir: Path) -> Optional[str]:
     return None
 
 
+def _infer_dims_from_checkpoint(checkpoint: Path) -> tuple[int, int]:
+    """Read action_dim and state_dim from a checkpoint without loading full weights.
+
+    Inspects two small tensors with mmap so the call is O(1) I/O regardless of
+    checkpoint size.  Works for all current FastWAM checkpoint formats (17/14,
+    17/15, 16/14).
+    """
+    import torch
+    sd = torch.load(str(checkpoint), map_location="cpu", mmap=True, weights_only=False)
+    mot = sd.get("mot", {})
+    # action_encoder.weight: (hidden, action_dim)  or  head.weight: (action_dim, hidden)
+    head_w = mot.get("mixtures.action.head.weight")
+    if head_w is not None:
+        action_dim = int(head_w.shape[0])
+    else:
+        enc_w = mot.get("mixtures.action.action_encoder.weight")
+        if enc_w is None:
+            raise RuntimeError(
+                f"Cannot infer action_dim: neither 'mixtures.action.head.weight' nor "
+                f"'mixtures.action.action_encoder.weight' found in checkpoint {checkpoint}"
+            )
+        action_dim = int(enc_w.shape[1])
+    # proprio_encoder.weight: (out_features, state_dim)
+    pe = sd.get("proprio_encoder", {})
+    pe_w = pe.get("weight")
+    if pe_w is None:
+        raise RuntimeError(
+            f"Cannot infer state_dim: 'proprio_encoder.weight' not found in checkpoint {checkpoint}"
+        )
+    state_dim = int(pe_w.shape[1])
+    return action_dim, state_dim
+
+
 def _instructions_from_task_cfg(cfg) -> list[str]:
     """Distinct instructions recorded across the task's training datasets, in config order.
 
@@ -161,6 +194,7 @@ class FastWAMTA2Policy:
         task_map: Optional[Path] = None,
         compile_denoise: bool = True,
         warmup_steps: tuple[int, ...] = (),
+        config_overrides: tuple[str, ...] = (),
     ) -> None:
         self.task_map_path = task_map
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
@@ -187,7 +221,7 @@ class FastWAMTA2Policy:
         with initialize_config_dir(version_base="1.3", config_dir=str(configs_root)):
             cfg = compose(
                 config_name="train",
-                overrides=[f"task={task_name}"],
+                overrides=[f"task={task_name}", *config_overrides],
             )
 
         model_cfg = OmegaConf.create(OmegaConf.to_container(cfg.model, resolve=True))
@@ -202,6 +236,12 @@ class FastWAMTA2Policy:
         # The checkpoint is verified below to cover every expert parameter, so the random init
         # this flag leaves behind never survives into inference.
         model_cfg.skip_dit_load_from_pretrain = True
+        # Skipping the pretrained read is not enough on its own: the random init still builds
+        # the 5B video DiT in fp32 on the host (~19 GiB RSS) before casting and moving it.
+        # Allocate it uninitialized, straight on the GPU in the target dtype, instead. Safe for
+        # the same reason as above -- load_checkpoint rejects any tensor the checkpoint leaves
+        # undefined.
+        model_cfg.uninitialized_dit = True
         # Resolve the conditioning *before* building the model: a missing embedding should fail
         # in a second, not after loading 12 GiB of weights.
         if prompt_task is None and text_embed is None:
@@ -220,7 +260,36 @@ class FastWAMTA2Policy:
         else:
             text_embed_path = self._resolve_text_embed(cfg, text_embed, prompt_task)
 
+        # Infer action/state dims from the checkpoint itself and check them against the
+        # composed config before building the model, so a lift-mode mismatch fails in a
+        # second instead of after instantiating it. O(1) I/O via mmap -- only a few small
+        # tensors are read, not the full 12 GB.
+        ckpt_action_dim, ckpt_state_dim = _infer_dims_from_checkpoint(checkpoint)
+        cfg_action_dim  = int(cfg.data.train.processor.action_output_dim)
+        cfg_state_dim   = int(cfg.data.train.processor.proprio_output_dim)
+        if ckpt_action_dim != cfg_action_dim or ckpt_state_dim != cfg_state_dim:
+            raise ValueError(
+                f"Checkpoint dimension mismatch.\n"
+                f"  Checkpoint:  action_dim={ckpt_action_dim}  state_dim={ckpt_state_dim}\n"
+                f"  Task config: action_dim={cfg_action_dim}   state_dim={cfg_state_dim}\n"
+                f"  (task={task_name})\n"
+                f"\n"
+                f"Most likely a lift-mode mismatch.  Try one of:\n"
+                f"  --config-override lift=on      # action 17-d / state 14-d\n"
+                f"  --config-override lift=off     # action 16-d / state 14-d\n"
+                f"  --config-override lift=legacy  # action 17-d / state 15-d "
+                f"(pre-split runs, trained before 2026-09-12)"
+            )
+
         self.model = instantiate(model_cfg, model_dtype=self.dtype, device=str(self.device))
+
+        # Expose for downstream use (metadata, client decisions).
+        self.action_dim = ckpt_action_dim
+        self.state_dim  = ckpt_state_dim
+        t = cfg.data.train.processor.action_state_transforms[0]
+        self.lift_in_action = bool(t.get("lift_in_action", t.get("include_lift", False)))
+        self.lift_in_state  = bool(t.get("lift_in_state",  t.get("include_lift", False)))
+
         try:
             # Pretrained backbones were skipped above, so an uncovered parameter would fall back
             # to random init instead of pretrained weights. Fail instead of serving that.

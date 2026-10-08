@@ -18,6 +18,13 @@ logger = get_logger(__name__)
 SKIPPED_PRETRAIN_SENTINEL = "SKIPPED_PRETRAIN"
 
 
+def _recompute_dit_freqs(model: WanVideoDiT) -> None:
+    # `freqs` is a plain attribute rather than a registered buffer, so meta-device construction
+    # leaves it on the meta device and no checkpoint ever sets it. It is a pure function of
+    # `attn_head_dim`, so recompute it.
+    model.freqs = precompute_freqs_cis_3d(int(model.attn_head_dim))
+
+
 def build_dit_uninitialized(dit_config: dict[str, Any], device: str, torch_dtype: torch.dtype) -> WanVideoDiT:
     """Allocate the 5B video DiT directly on `device` without materializing it on the host.
 
@@ -42,9 +49,7 @@ def build_dit_uninitialized(dit_config: dict[str, Any], device: str, torch_dtype
     # half of it on the bf16 cast -- enough to OOM a 24 GB card. Casting while still on meta
     # costs nothing and allocates 9.3 GiB once.
     model = model.to(dtype=torch_dtype).to_empty(device=device)
-    # `freqs` is a plain attribute rather than a registered buffer, so `to_empty` leaves it on the
-    # meta device. It is a pure function of `attn_head_dim`, so recompute it here.
-    model.freqs = precompute_freqs_cis_3d(int(model.attn_head_dim))
+    _recompute_dit_freqs(model)
     return model
 
 
@@ -66,12 +71,18 @@ WAN22_MODEL_REGISTRY = [
         "model_hash": "9c8818c2cbea55eca56c7b447df170da",
         "model_name": "wan_video_text_encoder",
         "model_class": WanTextEncoder,
+        # The file supplies every parameter and the class has no buffers or plain tensor
+        # attributes, so it can be built on the meta device (see `_load_registered_model`).
+        "meta_init": True,
     },
     {
         # Example: ModelConfig(model_id="Wan-AI/Wan2.2-TI2V-5B", origin_file_pattern="diffusion_pytorch_model*.safetensors")
         "model_hash": "1f5ab7703c6fc803fdded85ff040c316",
         "model_name": "wan_video_dit",
         "model_class": WanVideoDiT,
+        # Same, except for `freqs`, which is recomputed after loading.
+        "meta_init": True,
+        "after_meta_init": _recompute_dit_freqs,
     },
     {
         # Example: ModelConfig(model_id="Wan-AI/Wan2.2-TI2V-5B", origin_file_pattern="Wan2.2_VAE.pth")
@@ -79,6 +90,8 @@ WAN22_MODEL_REGISTRY = [
         "model_name": "wan_video_vae",
         "model_class": WanVideoVAE38,
         "state_dict_converter": wan_video_vae_state_dict_converter,
+        # No meta_init: `mean` / `std` / `scale` are plain tensors computed in __init__. At
+        # 1.4 GB the default path costs little anyway.
     },
 ]
 
@@ -142,12 +155,33 @@ def _load_registered_model(
         model_kwargs.update(model_kwargs_override)
     state_dict_converter = matched_config.get("state_dict_converter")
 
-    model = model_class(**model_kwargs)
-    state_dict = load_state_dict(path, torch_dtype=torch_dtype, device="cpu")
-    if state_dict_converter is not None:
-        state_dict = state_dict_converter(state_dict)
-
-    model.load_state_dict(state_dict, strict=False)
+    if matched_config.get("meta_init", False):
+        # Constructing normally runs every initializer in fp32 on the host only to overwrite the
+        # result: umT5-XXL then peaks at ~34 GB (23 GB fp32 model + 11 GB bf16 weights), the DiT
+        # at ~28 GB -- more than a 32 GB machine has. Build on the meta device instead and adopt
+        # the loaded tensors as the parameters, so the peak is the weights alone.
+        with torch.device("meta"):
+            model = model_class(**model_kwargs)
+        state_dict = load_state_dict(path, torch_dtype=torch_dtype, device="cpu")
+        if state_dict_converter is not None:
+            state_dict = state_dict_converter(state_dict)
+        incompatible = model.load_state_dict(state_dict, strict=False, assign=True)
+        del state_dict
+        if incompatible.missing_keys:
+            # Anything the file does not supply would be left on the meta device.
+            raise RuntimeError(
+                f"{model_name}: {path} lacks {len(incompatible.missing_keys)} tensor(s) that "
+                f"meta-device construction needs: {incompatible.missing_keys[:10]}"
+            )
+        after_meta_init = matched_config.get("after_meta_init")
+        if after_meta_init is not None:
+            after_meta_init(model)
+    else:
+        model = model_class(**model_kwargs)
+        state_dict = load_state_dict(path, torch_dtype=torch_dtype, device="cpu")
+        if state_dict_converter is not None:
+            state_dict = state_dict_converter(state_dict)
+        model.load_state_dict(state_dict, strict=False)
     model = model.to(device=device, dtype=torch_dtype)
     return model
 

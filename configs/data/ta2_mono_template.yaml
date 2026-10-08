@@ -37,15 +37,14 @@ train:
         raw_shape: [3, 80, 128]
         shape: [3, 80, 128]
 
-    action:
-      - key: default
-        raw_shape: 72              # raw vector, incl. EE / chassis
-        shape: 16                  # after TeleavatarSelectTransform
-
-    state:
-      - key: default
-        raw_shape: 72
-        shape: 14                  # after TeleavatarSelectTransform
+    # action / state shape_meta is not set here: configs/lift/{off,on,legacy}.yaml
+    # provides it together with *_output_dim and the transform's lift flags, so the
+    # three cannot drift apart. Raw vectors are 72-d (incl. EE / chassis / kinco); after
+    # TeleavatarSelectTransform:
+    #   lift=off    -> action 16-d / state 14-d
+    #   lift=on     -> action 17-d / state 14-d
+    #   lift=legacy -> action 17-d / state 15-d   (loading runs from before 2026-09-12 only)
+    # Pick one in the task config defaults: `- /lift: "off"` or `- /lift: "on"`.
 
   # --- sampling ---
   num_frames: 33                   # frames per sample (incl. 1 action offset)
@@ -79,14 +78,14 @@ train:
     ta2_wrist_tile: [80, 128]
     ta2_fill: 0.5                  # canvas padding value, before [-1,1] normalization
 
-    action_output_dim: 16
-    proprio_output_dim: 14
+    # action_output_dim / proprio_output_dim / action_state_transforms (gripper
+    # effort -> trigger conversion and the lift flags) also come from configs/lift/.
+    #
+    # Only enable the lifting column (kinco, raw index 71) if the dataset actually moves
+    # it -- it is constant 0 on every MK_tower floor. lift=on adds the lift *command* to
+    # the action but not the measured velocity to the state: there is no lift state topic
+    # at deploy time (dev docs §4.8), so that channel is always 0 on the robot.
     delta_action_dim_mask: null
-
-    action_state_transforms:
-      - _target_: fastwam.datasets.lerobot.transforms.teleavatar.TeleavatarSelectTransform
-        keys: [default]
-        convert_gripper_to_trigger: true   # gripper effort (N*m) -> trigger [0,1]
 
     use_stepwise_action_norm: false
     norm_default_mode: min/max

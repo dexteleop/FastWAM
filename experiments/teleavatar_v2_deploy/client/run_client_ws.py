@@ -10,7 +10,7 @@ Example:
 
     # Then run client (on robot control machine)
     python client/run_client_ws.py \\
-        --server-host 192.168.1.100 \\
+        --server-host <gpu-host-ip> \\
         --server-port 8000 \\
         --control-hz 20 \\
         --publish-hz 200 \\
@@ -191,6 +191,22 @@ def main() -> None:
         help="Infer only, do not publish motion commands",
     )
     parser.add_argument(
+        "--lift-dry-run",
+        action="store_true",
+        help="For 17-d (lift) policies: log raw->normalized lift commands instead "
+             "of publishing /api/servo/cmd. Arms and grippers still move. Use this "
+             "to verify lift.cmd_scale in arm_config.yml before the column moves.",
+    )
+    parser.add_argument(
+        "--lift-mode",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help="Lifting-column handling. 'auto' follows the server's lift_enabled "
+             "metadata. 'off' drops action[16] and never publishes /api/servo/cmd, even "
+             "for a 17-d policy -- use for first power-on and non-lift robots. 'on' "
+             "forces the column on and errors if the server serves a 16-d policy.",
+    )
+    parser.add_argument(
         "--hold-s",
         type=float,
         default=2.0,
@@ -292,6 +308,32 @@ def main() -> None:
             metadata.get("active_task"),
         )
 
+    # Resolve the lift mode against what the server actually serves. Older servers do not
+    # report these keys, so fall back to the action width and finally to "let the action
+    # width decide" (None), which is the pre-change behaviour.
+    srv_lift_in_action = metadata.get("lift_in_action")
+    if srv_lift_in_action is None and metadata.get("action_dim") is not None:
+        srv_lift_in_action = int(metadata["action_dim"]) >= 17
+    srv_lift_enabled = metadata.get("lift_enabled", srv_lift_in_action)
+    if args.lift_mode == "off":
+        lift_enabled = False
+    elif args.lift_mode == "on":
+        if srv_lift_in_action is False:
+            logger.error(
+                "--lift-mode on, but the server serves a %s-d policy with no lift channel. "
+                "Use --lift-mode auto/off, or point at a 17-d checkpoint.",
+                metadata.get("action_dim", "?"),
+            )
+            sys.exit(1)
+        lift_enabled = True
+    else:
+        lift_enabled = srv_lift_enabled
+    logger.info(
+        "Lift: mode=%s enabled=%s (server action_dim=%s lift_in_action=%s lift_in_state=%s)",
+        args.lift_mode, lift_enabled, metadata.get("action_dim"),
+        srv_lift_in_action, metadata.get("lift_in_state"),
+    )
+
     # Create environment before wrapping the policy: ChunkRecordingPolicy needs to
     # reach the environment's bag bridge, and the broker must sit outermost.
     logger.info("Initializing FastWAM environment...")
@@ -307,6 +349,9 @@ def main() -> None:
         swap_grippers=args.swap_grippers,
         min_grasp_hold_s=args.min_grasp_hold_s,
         grasp_close_trigger=args.grasp_close_trigger,
+        lift_dry_run=args.lift_dry_run,
+        lift_enabled=lift_enabled,
+        lift_state_consumed=bool(metadata.get("lift_in_state", False)),
     )
 
     # Resolve the bridge lazily: _ros_interface is assigned from the ROS spin thread,
@@ -357,10 +402,18 @@ def main() -> None:
             action = action_dict['actions']
 
             if args.dry_run:
+                if len(action) >= 17:
+                    # Show the value either way, but mark it when the column is disabled
+                    # so a non-zero command in the log is not read as column motion.
+                    lift = f" lift={action[16]:+.2f}"
+                    if not lift_enabled:
+                        lift += "(disabled)"
+                else:
+                    lift = ""
                 logger.info(
                     f"[DRY RUN] step={step} "
                     f"L_q0={action[0]:.3f} R_q0={action[8]:.3f} "
-                    f"L_grip={action[7]:.3f} R_grip={action[15]:.3f}"
+                    f"L_grip={action[7]:.3f} R_grip={action[15]:.3f}{lift}"
                 )
             else:
                 # Apply action

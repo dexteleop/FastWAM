@@ -105,6 +105,16 @@ def main() -> None:
         help="if set and recorded_action exists, pass it into infer_joint as video condition "
         "(experimental; default is open-loop joint predict of video+action)",
     )
+    parser.add_argument(
+        "--config-override",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        dest="config_overrides",
+        help="Extra hydra override appended after task=<name>; repeatable. Same as "
+             "serve_policy_ws.py, e.g. --config-override lift=legacy for a pre-split "
+             "17/15 checkpoint",
+    )
     args = parser.parse_args()
 
     export_dir = args.export.expanduser().resolve()
@@ -133,6 +143,7 @@ def main() -> None:
         prompt_task=args.prompt_task,
         text_embed=args.text_embed,
         load_text_encoder=args.load_text_encoder,
+        config_overrides=tuple(args.config_overrides),
     )
 
     summary: List[Dict[str, Any]] = []
@@ -179,7 +190,9 @@ def main() -> None:
             t = min(ra.shape[0], pred_action.shape[0])
             d = int(min(ra.shape[1], pred_action.shape[1])) if ra.ndim == 2 else 0
             if t > 0 and d > 0:
-                err = np.mean(np.abs(pred_action[:t, :d] - ra[:t, :d]))
+                # float(): np.float32 is not JSON-serializable, and summary.jsonl below
+                # would fail after every sample had already been inferred.
+                err = float(np.mean(np.abs(pred_action[:t, :d] - ra[:t, :d])))
             else:
                 err = None
         else:

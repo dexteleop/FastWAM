@@ -1,0 +1,46 @@
+# @package _global_
+# ^ A hydra directive, not a comment. Without it the keys below nest under `lift.` and never
+#   reach data.train.
+#
+# Lifting column, OLD semantics (before the split): action 17-d / state 15-d
+#
+#   action 17-d = [L_arm(7), L_grip, R_arm(7), R_grip, lift_vel_cmd]
+#   state  15-d = [L_arm(7), R_arm(7), lift_measured_vel]
+#
+# Only for loading / reproducing runs trained with include_lift before 2026-09-12. Their
+# proprio_encoder takes 15 inputs, so loading them with lift=on (14-d state) fails the
+# dimension check.
+#
+#   --config-override lift=legacy        # serve_policy_ws.py / offline tools
+#   bash scripts/launch_train.sh <task> lift=legacy
+#
+# **Do not train new runs with it.** The measured lift velocity in the state has no topic to
+# read at deploy time (§4.8), so the client can only send 0, while in training it is highly
+# correlated with the command -- which is why early 17/15 checkpoints never lowered the column
+# on the robot. See configs/lift/on.yaml and docs/GUIDE.md.
+#
+# As with on.yaml: literals only; hydra replaces lists, so every section is spelled out in full.
+
+data:
+  train:
+    shape_meta:
+      action:
+        - key: default
+          raw_shape: 72
+          shape: 17          # 16 + lift command
+      state:
+        - key: default
+          raw_shape: 72
+          shape: 15          # both arms' joints + measured lift velocity
+
+    processor:
+      # Through configs/model/fastwam.yaml these set action_encoder / head and proprio_encoder.
+      action_output_dim: 17
+      proprio_output_dim: 15
+
+      action_state_transforms:
+        - _target_: fastwam.datasets.lerobot.transforms.teleavatar.TeleavatarSelectTransform
+          keys: [default]
+          convert_gripper_to_trigger: true
+          lift_in_action: true
+          lift_in_state: true

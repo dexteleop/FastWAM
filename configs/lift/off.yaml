@@ -1,0 +1,46 @@
+# @package _global_
+# ^ A hydra directive, not a comment. Without it the keys below nest under `lift.` and never
+#   reach data.train.
+#
+# Lifting column (kinco) OFF: action 16-d / state 14-d
+#
+#   action 16-d = [L_arm(7), L_grip, R_arm(7), R_grip]
+#   state  14-d = [L_arm(7), R_arm(7)]
+#
+# For robots without a lifting column, and for datasets whose kinco channel is constant 0
+# (e.g. MK_tower floors 2-8 never move the column, so it would only add a constant column).
+#
+# The only difference from lift=on is the last action dim -- the state has the same width in
+# both modes, so the same raw 72-d client observation works with either.
+#
+# Literals only -- no ${eval:...} / ${sum_shapes:...}. serve_policy.py does not call
+# register_default_resolvers(), so a custom resolver fails at hydra compose time on the
+# deploy side.
+#
+# Hydra replaces lists rather than merging them, so shape_meta and action_state_transforms
+# are spelled out in full, not just the entry that differs.
+
+data:
+  train:
+    shape_meta:
+      action:
+        - key: default
+          raw_shape: 72
+          shape: 16
+      state:
+        - key: default
+          raw_shape: 72
+          shape: 14
+
+    processor:
+      # Through configs/model/fastwam.yaml these set the shapes of ActionDiT's
+      # action_encoder / head and the proprio_encoder; they must match shape above.
+      action_output_dim: 16
+      proprio_output_dim: 14
+
+      action_state_transforms:
+        - _target_: fastwam.datasets.lerobot.transforms.teleavatar.TeleavatarSelectTransform
+          keys: [default]
+          convert_gripper_to_trigger: true
+          lift_in_action: false
+          lift_in_state: false

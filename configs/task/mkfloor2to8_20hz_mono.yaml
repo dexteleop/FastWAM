@@ -1,0 +1,56 @@
+# @package _global_
+# ^ A hydra directive, not a comment. Without it every key below nests under `task.`
+#   and composition fails with "Could not override 'data@task.data'". Do not delete.
+#
+# Worked example: ta2_mono_template.yaml filled in for one dataset (MK_tower floors 2-8,
+# 20 fps, mono mosaic, trained from scratch). Start a new task from the template; read this
+# file to see what a finished one looks like.
+#
+#   bash scripts/launch_train.sh mkfloor2to8_20hz_mono            # ZeRO-1
+#   ZERO=2 bash scripts/launch_train.sh mkfloor2to8_20hz_mono     # ZeRO-2
+#
+# Resume and LR anneal need no separate config; override on the command line. See docs/GUIDE.md.
+
+defaults:
+  # The lifting column (kinco) is constant 0 on every MK_tower floor: 16-d, no lift.
+  - /lift: "off"
+  - override /data: mkfloor2to8_20hz_mono
+  - override /model: fastwam
+  - _self_
+
+batch_size: 8
+num_workers: 12
+
+model:
+  mot_checkpoint_mixed_attn: false
+
+lr_scheduler_type: "cosine"
+learning_rate: 1e-4
+
+num_epochs: 10
+max_steps: null
+resume: null
+resume_reinit_lr: false
+additional_steps: null
+
+log_every: 10
+save_every: 4000
+eval_every: 1000
+eval_num_inference_steps: 10
+
+gradient_accumulation_steps: 2
+weight_decay: 1e-2
+
+# Fresh run: normalization stats are computed at startup and saved to
+# runs/<task>/<RUN_ID>/dataset_stats.json. Only a resume sets data.train.pretrained_norm_stats.
+
+wandb:
+  # Off so the example runs without credentials. To enable: set workspace, then pass
+  # wandb.enabled=true (launch_train.sh checks ~/.netrc or WANDB_API_KEY).
+  enabled: false
+  workspace: null           # your wandb entity
+  project: mkfloor2to8-mono
+  # Setting `name` here has no effect: train_zeroN.sh always overrides it with the task
+  # name. Pass wandb.name=... on the command line instead (command line wins).
+  group: null
+  mode: online

@@ -52,6 +52,9 @@ class FastWAMEnvironment:
         grasp_close_trigger: float = 0.5,
         recovery_ramp_s: float = 0.75,
         outage_poll_hz: float = 100.0,
+        lift_dry_run: bool = False,
+        lift_enabled: Optional[bool] = None,
+        lift_state_consumed: bool = False,
     ):
         """Initialize FastWAM environment.
 
@@ -74,6 +77,16 @@ class FastWAMEnvironment:
             grasp_close_trigger: Trigger threshold for grasp
             recovery_ramp_s: Ramp duration after sensor outage
             outage_poll_hz: Rate to check sensors during outage
+            lift_dry_run: For 17-d (lift) policies, log the raw->normalized lift
+                command instead of publishing to /api/servo/cmd. Use this to
+                validate lift.cmd_scale before letting the column move.
+            lift_enabled: None follows the action width (any 17-d action drives the
+                column). False drops action[16] and never publishes
+                /api/servo/cmd, even for a 17-d policy. Normally set from the
+                server's `lift_enabled` metadata.
+            lift_state_consumed: True when the served model takes the lift measured
+                velocity as a state input, which no public topic can supply (§4.8).
+                Only then does the client warn about pinning raw state[71] to 0.
         """
         self._task = task
         self._prompt = prompt
@@ -103,6 +116,9 @@ class FastWAMEnvironment:
                 swap_grippers=swap_grippers,
                 min_grasp_hold_s=min_grasp_hold_s,
                 grasp_close_trigger=grasp_close_trigger,
+                lift_dry_run=lift_dry_run,
+                lift_enabled=lift_enabled,
+                lift_state_consumed=lift_state_consumed,
             )
         except BaseException:
             # __init__ has no usable instance to return, so clean up here rather
@@ -327,7 +343,8 @@ class FastWAMEnvironment:
         """Apply action to robot.
 
         Args:
-            action: Dictionary containing 'actions' key with 16-dim action array
+            action: Dictionary containing 'actions' key with a 16-dim action array,
+                or 17-dim when the policy also commands the lifting column.
         """
         if self._ros_interface is None:
             raise RuntimeError("ROS2 interface not initialized")
@@ -339,9 +356,9 @@ class FastWAMEnvironment:
         if not isinstance(actions, np.ndarray):
             actions = np.array(actions, dtype=np.float32)
 
-        # Ensure correct shape
-        if actions.shape != (16,):
-            raise ValueError(f"Expected 16-dim action, got shape {actions.shape}")
+        # Ensure correct shape. 17-d carries a trailing lifting-column velocity.
+        if actions.shape not in {(16,), (17,)}:
+            raise ValueError(f"Expected 16- or 17-dim action, got shape {actions.shape}")
 
         # Use longer ramp after outage to avoid jerky motion
         ramp_duration = self._recovery_ramp_s if self._pending_recovery else None

@@ -15,7 +15,7 @@ apex/
 assets/
 runs
 runs/
-# Training / transcode / ks3 logs. `logs` is usually a symlink to a storage volume,
+# Training / transcode logs. `logs` is usually a symlink to a storage volume,
 # so committing it would check a machine-specific absolute path into the repo.
 logs
 logs/
@@ -28,7 +28,6 @@ ppt_assets/
 # ai coding
 .codex/
 .claude/
-.ks3util_checkpoint/
 
 # Data types
 *.jit

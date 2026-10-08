@@ -54,12 +54,12 @@ def _lazy_import_msgpack():
         # Try openpi_client package first
         from openpi_client import msgpack_numpy
     except ImportError:
-        # Fallback to local copy
-        logger.warning("openpi_client not found, using msgpack-numpy directly")
-        import msgpack
-        import msgpack_numpy as _msgpack_numpy
-        _msgpack_numpy.patch()
-        msgpack_numpy = _msgpack_numpy
+        # Fall back to the vendored copy of the same module. Not the PyPI `msgpack-numpy`
+        # package: its array layout differs, and every array a client sends would arrive as a
+        # dict.
+        if str(Path(__file__).parent) not in sys.path:
+            sys.path.insert(0, str(Path(__file__).parent))
+        import openpi_msgpack_numpy as msgpack_numpy
     return msgpack_numpy
 
 
@@ -232,6 +232,26 @@ def main() -> None:
         default=None,
         help="num_inference_steps values for CUDA Graph warmup",
     )
+    parser.add_argument(
+        "--lift-mode",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help="Lifting-column handling. 'auto' follows the checkpoint: a 17-d "
+             "action drives the column, a 16-d one does not. 'off' refuses to drive "
+             "the column even for a 17-d checkpoint -- action[16] is dropped and "
+             "/api/servo/cmd is never published (use for first power-on and for "
+             "non-lift robots). 'on' requires a 17-d checkpoint and errors otherwise.",
+    )
+    parser.add_argument(
+        "--config-override",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        dest="config_overrides",
+        help="Extra hydra override appended after task=<name>; repeatable. Use this to "
+             "select the lift dimensions when they differ from the task default, e.g. "
+             "--config-override lift=off",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -267,7 +287,37 @@ def main() -> None:
         task_map=args.task_map,
         compile_denoise=not args.no_compile_denoise,
         warmup_steps=tuple(args.warmup_steps or ()),
+        config_overrides=tuple(args.config_overrides or ()),
     )
+
+    # Resolve --lift-mode against what the checkpoint actually produces. `policy.action_dim`
+    # and `policy.lift_in_action` were cross-checked against the composed config in
+    # FastWAMTA2Policy.__init__, so they describe the served model, not an assumption.
+    if args.lift_mode == "on" and not policy.lift_in_action:
+        raise SystemExit(
+            f"--lift-mode on requires a 17-d (lift) checkpoint, but this one has "
+            f"action_dim={policy.action_dim}. Either use a lift checkpoint or pass "
+            f"--lift-mode off/auto."
+        )
+    lift_enabled = policy.lift_in_action and args.lift_mode != "off"
+    if policy.lift_in_action and args.lift_mode == "off":
+        logger.warning(
+            "LIFT FORCED OFF: checkpoint is 17-d but --lift-mode off was given; action[16] "
+            "is dropped and /api/servo/cmd will never be published."
+        )
+    logger.info(
+        "Lift: mode=%s enabled=%s (checkpoint action_dim=%d state_dim=%d, "
+        "lift_in_action=%s lift_in_state=%s)",
+        args.lift_mode, lift_enabled, policy.action_dim, policy.state_dim,
+        policy.lift_in_action, policy.lift_in_state,
+    )
+    if policy.lift_in_state:
+        logger.warning(
+            "This checkpoint consumes the lifting-column measured velocity as state input, "
+            "but no public topic supplies it (§4.8) -- the client pins it to 0. Expect "
+            "degraded lift behaviour; prefer a checkpoint trained with `lift=on` "
+            "(action 17-d / state 14-d)."
+        )
 
     logger.info("Running warmup iterations...")
     policy.warmup(args.warmup_iters)
@@ -280,7 +330,14 @@ def main() -> None:
     metadata = {
         "task": args.task,
         "action_horizon": args.action_horizon,
-        "action_dim": 16,
+        # Derived from the checkpoint, not hardcoded: a 17-d lift model used to be
+        # advertised as 16-d here, which made the client log the wrong width.
+        "action_dim": policy.action_dim,
+        "state_dim": policy.state_dim,
+        "lift_mode": args.lift_mode,
+        "lift_enabled": lift_enabled,
+        "lift_in_action": policy.lift_in_action,
+        "lift_in_state": policy.lift_in_state,
         "num_inference_steps": args.num_inference_steps,
         "device": args.device,
         "available_tasks": list(policy.task_library.keys()) if hasattr(policy, 'task_library') else [],

@@ -46,8 +46,30 @@ head -1 "${PROJ}/configs/task/${TASK}.yaml" | grep -q '@package _global_' \
 [[ -f "${PROJ}/scripts/train_zero${ZERO}.sh" ]] \
   || { echo "ZERO=${ZERO} is not valid (use 1 or 2)" >&2; exit 1; }
 
-if [[ -z "${WANDB_API_KEY:-}" ]] && ! grep -q "api.wandb.ai" ~/.netrc 2>/dev/null; then
-  echo "No wandb credentials: api.wandb.ai absent from ~/.netrc and WANDB_API_KEY unset." >&2
+# lift= must name a file under configs/lift/. A typo otherwise sends hydra looking for
+# configs/lift/<typo>.yaml, and the error it prints points far from the cause.
+for _ov in "${OVERRIDES[@]+"${OVERRIDES[@]}"}"; do
+  if [[ "${_ov}" == lift=* ]]; then
+    _lv="${_ov#lift=}"
+    _lv="${_lv%\'}"; _lv="${_lv#\'}"; _lv="${_lv%\"}"; _lv="${_lv#\"}"
+    [[ -f "${PROJ}/configs/lift/${_lv}.yaml" ]] || {
+      echo "lift=${_lv} is not valid. Available: $(ls "${PROJ}/configs/lift" | sed 's/\.yaml$//' | tr '\n' ' ')" >&2
+      exit 1
+    }
+  fi
+done
+
+# wandb credentials are only needed when wandb is on. A command-line wandb.enabled= wins
+# over the task config's `wandb.enabled`, which wins over train.yaml (false).
+WANDB_ON="$(awk '/^wandb:/{b=1; next} b && /^[^[:space:]#]/{b=0} b && /^[[:space:]]+enabled:/{print $2; exit}' \
+  "${PROJ}/configs/task/${TASK}.yaml")"
+for _ov in "${OVERRIDES[@]+"${OVERRIDES[@]}"}"; do
+  [[ "${_ov}" == wandb.enabled=* || "${_ov}" == +wandb.enabled=* || "${_ov}" == ++wandb.enabled=* ]] \
+    && WANDB_ON="${_ov#*wandb.enabled=}"
+done
+if [[ "${WANDB_ON,,}" == "true" && -z "${WANDB_API_KEY:-}" ]] \
+   && ! grep -q "api.wandb.ai" ~/.netrc 2>/dev/null; then
+  echo "wandb is enabled but there are no credentials: api.wandb.ai absent from ~/.netrc and WANDB_API_KEY unset." >&2
   echo "Run 'wandb login', or pass wandb.enabled=false as an override." >&2
   exit 1
 fi

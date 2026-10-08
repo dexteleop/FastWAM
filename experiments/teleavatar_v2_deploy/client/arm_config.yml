@@ -11,6 +11,59 @@ arms:
   vel_limit: [ 15.0, 15.0, 20.0, 20.0, 44.0, 33.0, 33.0 ]
   acc_limit: [ 120.0, 120.0, 60.0, 60.0, 17.0, 14.0, 14.0 ]
 
+# Lifting column (kinco). Only read when serving a 17-d model (lift=on or lift=legacy); a
+# 16-d model ignores this whole section.
+lift:
+  # normalized_velocity = cmd_sign * action[16] / cmd_scale
+  #
+  # cmd_scale=150: §4.6 defines motor target speed = -normalized_velocity x 150 rad/s, and the
+  # dataset's kinco_velocity saturates at exactly +-150 -- the same constant on both sides,
+  # i.e. the dataset records the motor-side target speed.
+  #
+  # cmd_sign=-1: the dataset is motor-side, the interface is normalized-side, and they differ
+  # by a sign. Two independent pieces of evidence:
+  #   1) the §4.6 formula itself: normalized = -motor_speed / 150
+  #   2) recorded video: episode_000010 sends action[71] > +100 throughout t=3.75-13.05 s and
+  #      the litter box grows and rises in the head camera => the column is going down;
+  #      episode_000013 sends negative values throughout t=58.25-65.9 s and the view moves
+  #      the other way => up. §4.6 says positive normalized means up, so a positive
+  #      action[71] maps to a negative normalized velocity.
+  #
+  # Net: action[71] > 0 => column goes down => normalized < 0.
+  # On first power-up still run --lift-dry-run and read the log, then confirm the direction
+  # with a low max_normalized_velocity: a wrong sign drives the column the wrong way.
+  cmd_scale: 150.0
+  cmd_sign: -1.0
+
+  # Extra clamp on the normalized velocity before /api/servo/cmd. Start around 0.3 on first
+  # power-up and raise it to 1.0 once direction and magnitude are confirmed.
+  max_normalized_velocity: 1.0
+
+  # State topic for the measured lift velocity, written into index 71 of the raw 72-d vector.
+  #
+  # Only matters for **old 17/15 checkpoints** (trained before 2026-09-12, with the measured
+  # lift velocity in the state). The recommended lift=on mode is action 17-d / state 14-d --
+  # the lift is output only, this channel never reaches the model, and filling it changes
+  # nothing.
+  #
+  # The public interface has **no** lift state topic: §4.8 state feedback lists only
+  # /{arm_side}_arm/joint_states, /{arm_side}_gripper/joint_states and /chassis/joint_states,
+  # and §4.6 defines only the /api/servo/cmd command. Hence the default null, and state[71]
+  # stays 0. For old 17/15 checkpoints that is a real train/deploy skew (training saw a live
+  # signal correlated 0.9978 with the command; deployment reads a constant "stationary" 0, so
+  # the policy keeps commanding zero) -- which is exactly why the lift was dropped from the
+  # state. Startup warns once, and only when the server reports lift_in_state=true.
+  # If the robot has an unpublished lift state topic, setting it here closes that skew for old
+  # checkpoints. Example:
+  #   state_topic: /servo/joint_states
+  #   state_msg_type: sensor_msgs/msg/JointState   # JointState or Float32MultiArray
+  #   state_field: velocity                        # which JointState field to read
+  #   state_index: 0                               # element within the array
+  state_topic: null
+  state_msg_type: sensor_msgs/msg/JointState
+  state_field: velocity
+  state_index: 0
+
 ik_solver:
   debug: false
   arm_ctrl_dt: 0.01

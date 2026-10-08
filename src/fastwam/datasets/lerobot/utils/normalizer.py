@@ -16,6 +16,42 @@ logger = get_logger(__name__)
 ConstConstStr = Annotated[str, "format: 'const_min/const_max', where const_min and const_max give the constant range"]
 NormMode = Union[Literal["min/max", "q01/q99", "z-score"], ConstConstStr]
 
+def _assert_stats_match_shape_meta(shape_meta, stats) -> None:
+    """Fail early when a stats file was computed for a different action/state width.
+
+    Nothing downstream checks this: the normalizer just builds scale/offset from whatever
+    length the stats vectors happen to be, so pairing a run's checkpoint with another run's
+    `dataset_stats.json` surfaces much later as a confusing broadcast error -- or, when the
+    widths happen to broadcast, as silently wrong normalization. The lift config groups make
+    this easy to hit, since `lift=on` (state 14-d) and the pre-split 15-d runs differ by
+    exactly one trailing channel.
+    """
+    for field in ("action", "state"):
+        for meta in shape_meta.get(field, ()):
+            key = meta["key"]
+            if key is None:
+                continue
+            expected = int(meta["shape"])
+            field_stats = (stats or {}).get(field, {}).get(key)
+            if not field_stats:
+                continue
+            for stat_name, vec in field_stats.items():
+                # `global_*` are 1-D (dim,); `stepwise_*` are 2-D (horizon, dim). The channel
+                # count is the trailing axis in both, so never use len() here.
+                shape = getattr(vec, "shape", None)
+                if not shape:
+                    continue  # scalars (e.g. counts) carry no width
+                got = int(shape[-1])
+                if got != expected:
+                    raise ValueError(
+                        f"dataset_stats {field}['{key}']['{stat_name}'] has width {got}, but "
+                        f"shape_meta expects {expected}. The stats file does not belong to this "
+                        f"config -- most often a lift-mode mismatch (action 17/state 14 for "
+                        f"`lift=on`, 16/14 for `lift=off`, 17/15 for pre-split runs). Use the "
+                        f"dataset_stats.json produced by the same run as the checkpoint."
+                    )
+
+
 class LinearNormalizer:
     def __init__(
             self, 
@@ -28,6 +64,7 @@ class LinearNormalizer:
         super().__init__()
         self.normalizers = {"action": {}, "state": {}}
         self.stats = stats
+        _assert_stats_match_shape_meta(shape_meta, stats)
 
         for meta in shape_meta["action"]:
             key = meta["key"]

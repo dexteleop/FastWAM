@@ -220,7 +220,10 @@ def export_bag(bag: Path, out_dir: Path, match_ms: float = 1500.0) -> List[Dict[
                 cam = topic_to_cam[topic]
                 stamp_ns = int(msg.header.stamp.sec) * 10**9 + int(msg.header.stamp.nanosec)
                 g = obs_groups.setdefault(stamp_ns, {"stamp_ns": stamp_ns, "images": {}})
-                g["images"][cam] = _jpeg_bytes_to_rgb(bytes(msg.data))
+                # Keep the JPEG bytes and decode per sample below. Decoding here held every
+                # frame of the bag as RGB at once (~4 MB per sample, ~9 GB for a 2000-sample
+                # bag) before a single sample was written.
+                g["images"][cam] = bytes(msg.data)
             elif topic == "/fastwam/policy/action_chunk":
                 actions.append((int(t_ns), _action_from_multiarray(msg)))
             elif topic == "/fastwam/policy/inference_ms":
@@ -251,9 +254,10 @@ def export_bag(bag: Path, out_dir: Path, match_ms: float = 1500.0) -> List[Dict[
         sample_rel = f"samples/{idx:06d}"
         sample_dir = out_dir / sample_rel
         sample_dir.mkdir(parents=True, exist_ok=True)
+        images = {cam: _jpeg_bytes_to_rgb(g["images"][cam]) for cam in CAMS}
         for cam in CAMS:
-            Image.fromarray(g["images"][cam]).save(sample_dir / f"{cam}.jpg", quality=92)
-        mosaic = mosaic_from_cams(g["images"])
+            Image.fromarray(images[cam]).save(sample_dir / f"{cam}.jpg", quality=92)
+        mosaic = mosaic_from_cams(images)
         Image.fromarray(mosaic).save(sample_dir / "obs_mosaic.jpg", quality=92)
         np.save(sample_dir / "obs_mosaic.npy", mosaic)
 
@@ -331,31 +335,24 @@ def _estimate_obs_fps(rows: List[Dict[str, Any]], default: float = 2.0) -> float
 
 
 def make_full_recorded_videos(export_dir: Path, rows: List[Dict[str, Any]]) -> None:
-    """Stitch all bag observation frames into full-session mp4s (sparse ~infer rate)."""
+    """Stitch all bag observation frames into full-session mp4s (sparse ~infer rate).
+
+    Frames stream from the exported JPEGs into the encoder one at a time; collecting them
+    first held the whole session decoded in memory, four videos' worth.
+    """
     if not rows:
         return
     fps = _estimate_obs_fps(rows)
-    mosaic_frames = []
-    cam_frames: Dict[str, List[Image.Image]] = {c: [] for c in CAMS}
-    for row in rows:
-        sample_dir = export_dir / row["dir"]
-        mp = sample_dir / "obs_mosaic.jpg"
-        if mp.is_file():
-            mosaic_frames.append(Image.open(mp).convert("RGB"))
-        for cam in CAMS:
-            cp = sample_dir / f"{cam}.jpg"
-            if cp.is_file():
-                cam_frames[cam].append(Image.open(cp).convert("RGB"))
-    if mosaic_frames:
-        out = export_dir / "recorded_obs_mosaic_full.mp4"
-        save_mp4(mosaic_frames, str(out), fps=fps)
-        print(f"[viz] wrote {out} ({len(mosaic_frames)} frames @ {fps:.2f} fps)")
-    for cam, frames in cam_frames.items():
-        if not frames:
+    for name, out_name in [("obs_mosaic", "recorded_obs_mosaic_full.mp4")] + [
+        (cam, f"recorded_{cam}_full.mp4") for cam in CAMS
+    ]:
+        paths = [export_dir / row["dir"] / f"{name}.jpg" for row in rows]
+        paths = [p for p in paths if p.is_file()]
+        if not paths:
             continue
-        out = export_dir / f"recorded_{cam}_full.mp4"
-        save_mp4(frames, str(out), fps=fps)
-        print(f"[viz] wrote {out} ({len(frames)} frames @ {fps:.2f} fps)")
+        out = export_dir / out_name
+        save_mp4((Image.open(p) for p in paths), str(out), fps=fps)
+        print(f"[viz] wrote {out} ({len(paths)} frames @ {fps:.2f} fps)")
 
 
 def make_overview_strip(out_dir: Path, rows: List[Dict[str, Any]], max_n: int = 12) -> None:
@@ -553,6 +550,16 @@ def main() -> None:
         default=20.0,
         help="policy Hz for action_chunk timeline in action_viz",
     )
+    parser.add_argument(
+        "--config-override",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        dest="config_overrides",
+        help="Extra hydra override appended after task=<name>; repeatable. Same as "
+             "serve_policy_ws.py, e.g. --config-override lift=legacy for a pre-split "
+             "17/15 checkpoint",
+    )
     args = parser.parse_args()
 
     bag = args.bag.expanduser().resolve()
@@ -587,6 +594,7 @@ def main() -> None:
             prompt_task=args.prompt_task,
             text_embed=args.text_embed,
             load_text_encoder=args.load_text_encoder,
+            config_overrides=tuple(args.config_overrides),
         )
         run_predict_and_compare(
             rows,

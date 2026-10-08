@@ -175,6 +175,8 @@ def main() -> None:
         tokenizer_model_id=cfg.get("tokenizer_model_id", "Wan-AI/Wan2.1-T2V-1.3B"),
         redirect_common_files=redirect_common_files,
         dit_config=video_cfg,
+        # Only the video DiT is read here; the 11 GB text encoder would be dead weight.
+        load_text_encoder=False,
     )
     video_expert = components.dit
 
