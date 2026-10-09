@@ -46,6 +46,7 @@ ppt_assets/
 *.bin
 *.pickle
 *.txt
+!LICENSES/*.txt
 !**/requirements.txt
 !experiments/**/requirements.txt
 

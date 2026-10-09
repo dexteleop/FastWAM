@@ -50,6 +50,7 @@ variable tables are in [docs/GUIDE.md](./docs/GUIDE.md).
 - [Data conventions](#data-conventions)
 - [Further reading](#further-reading)
 - [Citation](#citation)
+- [License](#license)
 
 ---
 
@@ -133,7 +134,7 @@ the torch line, which needs the PyTorch index.
 System tools: `ffmpeg`/`ffprobe` with libx264 (transcoding) and `tmux` (`launch_train.sh`).
 Training also needs `nvcc`: DeepSpeed checks the CUDA toolkit version on import and
 `accelerate launch` fails with `MissingCUDAException: CUDA_HOME does not exist` without it.
-If the host has no CUDA toolkit, `conda install -y -c nvidia cuda-nvcc=12.8` into the env is
+If the host has no CUDA toolkit, `conda install -y -c conda-forge --override-channels cuda-nvcc=12.8` into the env is
 enough; `conda activate` puts it on `PATH`.
 
 ### Base weights
@@ -564,3 +565,17 @@ paper. If you use this work, please cite:
 
 The RoboTwin evaluation code is adapted from the
 [RoboTwin repository](https://github.com/RoboTwin-Platform/RoboTwin).
+
+---
+
+## License
+
+The code is released under the [MIT License](./LICENSE). Some files were copied or adapted
+from other open-source projects — DiffSynth-Studio, LeRobot, openpi, msgpack-numpy,
+PyTorch3D, robosuite, RoboTwin and one NVIDIA file — and stay under their original licenses
+(Apache-2.0, BSD-3-Clause or MIT). [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md) lists
+each one with its files and copyright; the full license texts are in [LICENSES/](./LICENSES/).
+
+The base weights are not part of this repository. They are downloaded under their own
+licenses: Wan2.2-TI2V-5B, the Wan2.1 umT5 tokenizer and DiffSynth-Studio's converted
+VAE/T5 files are all Apache-2.0.

@@ -664,7 +664,7 @@ does.
 | Action dimension mismatch at load | — | checkpoint, `dataset_stats.json` and task config must all come from the same run |
 | Server cannot find the VAE | `ls checkpoints/DiffSynth-Studio/Wan-Series-Converted-Safetensors/` | the VAE is not inside the `.pt`; copy it separately |
 | `Unknown task=...` on the first inference | server log / client error | the key is not in `taskmap.json` — regenerate it with `make_task_map.py` |
-| `MissingCUDAException: CUDA_HOME does not exist` at `accelerate launch` | `which nvcc` | no CUDA toolkit on the host — `conda install -y -c nvidia cuda-nvcc=12.8` into the env |
+| `MissingCUDAException: CUDA_HOME does not exist` at `accelerate launch` | `which nvcc` | no CUDA toolkit on the host — `conda install -y -c conda-forge --override-channels cuda-nvcc=12.8` into the env |
 | `RepositoryNotFoundError: 401` while downloading weights | `DIFFSYNTH_DOWNLOAD_SOURCE` | Hugging Face source needs `redirect_common_files: false` — see [Base weights and download sources](#base-weights-and-download-sources) |
 | `Cannot detect model type ... File: []` | `ls checkpoints/` against the README's tree | a base-weight file is missing — e.g. `DIFFSYNTH_SKIP_DOWNLOAD=true` forbade fetching it |
 | Training exits right after resuming | trainer warning | `max_steps` ≤ the resumed step: add `additional_steps` (with `resume_reinit_lr=true` to go past the original end) |
