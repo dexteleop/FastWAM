@@ -23,6 +23,7 @@ latency/
 evaluate_results/
 .deepspeed*
 Miniconda3*.sh
+Miniforge3*.sh
 ppt_assets/
 
 # ai coding

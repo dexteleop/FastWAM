@@ -31,8 +31,21 @@ ZERO="${ZERO:-1}"                       # 1 or 2
 NPROC="${NPROC:-8}"                     # GPUs per node
 KEEP="${KEEP:-2}"                       # ZeRO state snapshots to retain
 SESSION="${SESSION:-fastwam_${TASK}}"
-CONDA_SH="${CONDA_SH:-$HOME/miniconda3/etc/profile.d/conda.sh}"
 CONDA_ENV="${CONDA_ENV:-fastwam}"
+
+# conda's activation script. Default: the install behind the active `conda` ($CONDA_EXE,
+# exported by `conda activate`), else the first of ~/miniforge3, ~/miniconda3, ~/anaconda3.
+if [[ -z "${CONDA_SH:-}" ]]; then
+  _bases=()
+  [[ -n "${CONDA_EXE:-}" ]] && _bases+=("$(dirname "$(dirname "${CONDA_EXE}")")")
+  _bases+=("$HOME/miniforge3" "$HOME/miniconda3" "$HOME/anaconda3")
+  for _b in "${_bases[@]}"; do
+    if [[ -f "${_b}/etc/profile.d/conda.sh" ]]; then
+      CONDA_SH="${_b}/etc/profile.d/conda.sh"
+      break
+    fi
+  done
+fi
 
 # ---- Pre-flight: failing here is far cheaper than failing after 8 GPUs spin up ----
 [[ -f "${PROJ}/configs/task/${TASK}.yaml" ]] \
@@ -45,6 +58,13 @@ head -1 "${PROJ}/configs/task/${TASK}.yaml" | grep -q '@package _global_' \
 
 [[ -f "${PROJ}/scripts/train_zero${ZERO}.sh" ]] \
   || { echo "ZERO=${ZERO} is not valid (use 1 or 2)" >&2; exit 1; }
+
+# Without this check a wrong path only shows up inside the tmux windows.
+[[ -n "${CONDA_SH:-}" && -f "${CONDA_SH}" ]] || {
+  echo "conda activation script not found${CONDA_SH:+: ${CONDA_SH}}" >&2
+  echo "Set CONDA_SH=<conda base>/etc/profile.d/conda.sh ('conda info --base' prints the base)." >&2
+  exit 1
+}
 
 # lift= must name a file under configs/lift/. A typo otherwise sends hydra looking for
 # configs/lift/<typo>.yaml, and the error it prints points far from the cause.
@@ -110,6 +130,7 @@ which expands (inside train_zero${ZERO}.sh) to:
     wandb.name=${TASK} \\
     task=${TASK} ${OVERRIDES[*]}
 
+Environment:      ${ACTIVATE}
 DeepSpeed config: scripts/ds_configs/ds_zero${ZERO}_config.json ("stage": ${ZERO})
 Pruner:           python scripts/prune_states.py ${RUN_DIR} --keep ${KEEP} --watch 300
 EOF

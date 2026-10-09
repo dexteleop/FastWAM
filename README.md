@@ -102,6 +102,17 @@ to `127.0.0.1`); the two interpreters may not.
 
 ### Training / serving host
 
+Use [Miniforge](https://github.com/conda-forge/miniforge) for conda. It ships with
+conda-forge as its only channel, so Anaconda's Terms of Service, which cover the
+default Anaconda channels, never come into play. If you have no conda yet:
+
+```bash
+curl -L -O "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-$(uname)-$(uname -m).sh"
+bash Miniforge3-$(uname)-$(uname -m).sh        # installs to ~/miniforge3 by default
+```
+
+Then, in a new shell:
+
 ```bash
 conda create -n fastwam python=3.10 -y
 conda activate fastwam
@@ -112,9 +123,9 @@ pip install -e .
 pip install -e ".[analysis]"   # optional: the rosbag / plotting tools under Analysis tools
 ```
 
-Recent conda refuses `conda create` on the default Anaconda channels until their Terms of
-Service are accepted (`CondaToSNonInteractiveError`). Accept them as the error message
-describes, or create the env from conda-forge instead:
+Already on Miniconda or Anaconda? Recent versions refuse `conda create` on the default
+Anaconda channels until their Terms of Service are accepted (`CondaToSNonInteractiveError`).
+Create the env from conda-forge instead of accepting them:
 `conda create -n fastwam -c conda-forge --override-channels python=3.10 -y`. If PyPI is slow
 from your network, a PyPI mirror (`pip install -i <mirror> ...`) works for everything except
 the torch line, which needs the PyTorch index.
@@ -310,7 +321,7 @@ without it. Everything is controlled by environment variables:
 | `NPROC` | `8` | GPUs per node |
 | `KEEP` | `2` | ZeRO state snapshots to retain (with `1`, the previous one is deleted while the next is still being written) |
 | `SESSION` | `fastwam_<task>` | tmux session name |
-| `CONDA_SH` | `$HOME/miniconda3/etc/profile.d/conda.sh` | conda activation script |
+| `CONDA_SH` | the active conda's (`$CONDA_EXE`), else the first of `~/miniforge3`, `~/miniconda3`, `~/anaconda3` | `<conda base>/etc/profile.d/conda.sh`; the launcher stops before starting tmux if it is not found |
 | `CONDA_ENV` | `fastwam` | conda env to activate (name or path) |
 | `DRY_RUN` | — | print the command, start nothing |
 
