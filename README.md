@@ -79,8 +79,31 @@ pip install -e .
 pip install -e ".[analysis]"   # optional: the rosbag / plotting tools under Analysis tools
 ```
 
+System tools: `ffmpeg`/`ffprobe` with libx264 (transcoding) and `tmux` (`launch_train.sh`).
+Training also needs `nvcc`: DeepSpeed checks the CUDA toolkit version on import and
+`accelerate launch` fails with `MissingCUDAException: CUDA_HOME does not exist` without it.
+If the host has no CUDA toolkit, `conda install -y -c nvidia cuda-nvcc=12.8` into the env is
+enough; `conda activate` puts it on `PATH`.
+
+### Base weights
+
+Training needs the Wan2.2 base weights under `checkpoints/` (≈32 GB); a deploy-only machine
+needs just the VAE (see [Moving checkpoints](#moving-checkpoints-between-machines)).
+Missing files are downloaded automatically on first use, from ModelScope by default
+(`DIFFSYNTH_DOWNLOAD_SOURCE=huggingface` to switch, `DIFFSYNTH_SKIP_DOWNLOAD=true` to forbid
+it). If you already have them, place them like this — the directory names are load-bearing:
+
+```
+checkpoints/
+├── Wan-AI/Wan2.2-TI2V-5B/diffusion_pytorch_model-0000{1,2,3}-of-00003.safetensors   # 19 GB
+├── Wan-AI/Wan2.1-T2V-1.3B/google/umt5-xxl/                     # tokenizer files
+└── DiffSynth-Studio/Wan-Series-Converted-Safetensors/
+    ├── Wan2.2_VAE.safetensors                                  # 1.4 GB
+    └── models_t5_umt5-xxl-enc-bf16.safetensors                 # 11 GB, precompute only
+```
+
 Then pre-generate the ActionDiT backbone once (it is interpolated from the Wan2.2 DiT, not
-downloaded):
+downloaded; a deploy-only machine can skip it):
 
 ```bash
 mkdir -p checkpoints
@@ -92,8 +115,10 @@ python scripts/preprocess_action_dit_backbone.py \
   --device cuda --dtype bfloat16
 ```
 
-`DIFFSYNTH_MODEL_BASE_PATH` must be set for every training and serving process — the Wan
-component loader resolves all model paths relative to it.
+The Wan component loader resolves all model paths relative to `DIFFSYNTH_MODEL_BASE_PATH`
+(default `./checkpoints/`, i.e. relative to the working directory). Set it whenever the
+weights live elsewhere; note that `launch_train.sh` starts training in tmux, which inherits
+the tmux server's environment rather than your shell's if a server is already running.
 
 This step and the text-embedding precompute below both fit in 15 GB of host RAM (measured
 under a cgroup cap on a 32 GB / RTX 4090 box), so a workstation can run them.
@@ -152,8 +177,10 @@ cp configs/task/ta2_mono_template.yaml configs/task/<your_task>.yaml
 ```
 
 In the **data** config set `dataset_dirs` (one or more `*_mono` dirs) and
-`text_embedding_cache_dir`. In the **task** config point `override /data:` at your data config
-name and fill in `wandb`. Both templates document every field inline.
+`text_embedding_cache_dir` (convention: `./data/text_embeds_cache/<your_task>`; the commands
+below assume it). In the **task** config point `override /data:` at your data config name;
+wandb is off by default, enable it there if you want it. Both templates document every field
+inline.
 
 Camera resolutions in `shape_meta.images` must match the transcoded video exactly — a
 mismatch produces silently wrong results, not an error.
@@ -190,8 +217,30 @@ without it.
 | `NPROC` | `8` | GPUs per node |
 | `KEEP` | `2` | ZeRO state snapshots to retain |
 | `SESSION` | `fastwam_<task>` | tmux session name |
-| `CONDA_ENV` | `fastwam` | conda env to activate |
+| `CONDA_ENV` | `fastwam` | conda env to activate (name or path) |
 | `DRY_RUN` | — | print the command, start nothing |
+
+Before committing GPUs, check that the data loads (a few seconds, < 1 GB RAM; the
+normalization stats it computes go to a temporary directory):
+
+```bash
+python - <<'EOF'
+import os, tempfile
+from hydra import compose, initialize_config_dir
+from hydra.utils import instantiate
+from fastwam.utils import misc
+from fastwam.utils.config_resolvers import register_default_resolvers
+register_default_resolvers()
+misc.register_work_dir(tempfile.mkdtemp(prefix="fastwam_datacheck_"))
+with initialize_config_dir(config_dir=os.path.abspath("configs"), version_base="1.3"):
+    cfg = compose(config_name="train", overrides=["task=<your_task>"])
+ds = instantiate(cfg.data.train)
+print(len(ds), {k: tuple(v.shape) for k, v in ds[0].items() if hasattr(v, "shape")})
+EOF
+```
+
+Expect `video (3, 9, 352, 256)`, `action (32, 16)`, `proprio (32, 14)` for the TA2 mono
+template with `lift=off`.
 
 Any extra argument is passed through to hydra, so resume and LR-anneal need no new config file:
 
@@ -239,14 +288,19 @@ TASK=<your_task> bash start_local_serve_ws.sh 10     # 10 = denoising steps
 
 `RUN` and `STEP` default to the newest run and the highest step number; override either to pin
 a specific checkpoint. Wait for `WebSocket server listening on ws://0.0.0.0:8000` before
-starting the client. Health check: `curl http://<host>:8000/healthz`.
+starting the client. Health check: `curl http://<host>:8000/healthz`. The script runs
+`$PYTHON_BIN` (default: `python` on `PATH`, so activate the env first) and reads `RUN`, `STEP`,
+`CHECKPOINT`, `DATASET_STATS`, `TASK_MAP` (default `./taskmap.json`), `PROMPT_TASK`,
+`TEXT_EMBED`, `CONFIG_OVERRIDES`, `HOST`/`PORT` (default `0.0.0.0`/`8000`); its header
+documents each. It already warms CUDA Graphs for 8, 10 and 12 steps.
 
-`--task` must name the config the checkpoint was **trained** with — hydra recomposes the data
+`TASK` must name the config the checkpoint was **trained** with — hydra recomposes the data
 and model dimensions from it, so a mismatch fails at load time (by design; it used to fail
 much later and less clearly).
 
 A deploy machine usually has the text embeds but not the datasets, so the startup
-instruction cannot be read from `meta/tasks.jsonl`. In that case pass the embed directly. A
+instruction cannot be read from `meta/tasks.jsonl`. In that case pass the embed directly —
+`taskmap.json` maps each short name to its `<sha256>`, so use it to pick the file. A
 checkpoint whose lift mode differs from the task default takes `CONFIG_OVERRIDES`:
 
 ```bash
@@ -297,8 +351,8 @@ A checkpoint alone is not servable. These must travel together, from the **same 
 |---|---|
 | `checkpoints/weights/step_*.pt` | the weights (~12 GB) |
 | `dataset_stats.json` | action/state normalization — mixing runs silently drifts the action scale |
-| `config.yaml` | the run's resolved config |
-| `text_embeds_cache/` entries | the conditioning, byte-identical to training |
+| `config.yaml` | the run's resolved config (provenance only, optional) |
+| `text_embeds_cache/` entries | the conditioning, byte-identical to training — the directory is the data config's `text_embedding_cache_dir`, which need not equal the task name (the shipped example uses `mkfloor2to8_20hz` for task `mkfloor2to8_20hz_mono`) |
 | `Wan2.2_VAE.safetensors` | ~1.4 GB, **not** inside the `.pt` (only `mot` + `proprio_encoder` are saved) |
 
 The DiT shards (19 GB), ActionDiT payload (2 GB) and T5 encoder (11 GB) do **not** need to be
@@ -311,7 +365,7 @@ example, from the repo root on the training server:
 ```bash
 rsync -aR runs/<task>/<RUN_ID>/dataset_stats.json runs/<task>/<RUN_ID>/config.yaml \
   runs/<task>/<RUN_ID>/checkpoints/weights/step_<N>.pt \
-  data/text_embeds_cache/<task>/ \
+  data/text_embeds_cache/<cache dir from the data config>/ \
   checkpoints/DiffSynth-Studio/Wan-Series-Converted-Safetensors/Wan2.2_VAE.safetensors \
   <deploy-host>:/path/to/FastWAM/
 ```
@@ -323,9 +377,21 @@ which must match the one used for training.
 
 ## Analysis tools
 
-All under `experiments/teleavatar_v2_deploy/server/`. The ones that run the model need
-`--task` plus a matching `--checkpoint` / `--dataset-stats` pair from the same run; the rest
-only read a bag or a stream.
+All under `experiments/teleavatar_v2_deploy/server/`; run any of them with `--help`. The bag
+tools take `--bag <bag dir>` and write next to the bag unless given `--out`. The ones that
+run the model need `--task` plus a matching `--checkpoint` / `--dataset-stats` pair from the
+same run, and on a machine without the datasets also `--text-embed` (as for the server); the
+rest only read a bag or a stream. `offline_infer_from_export.py --export` takes the `export/`
+directory that `bag_visualize_and_predict.py` writes under its `--out` (or
+`client/export_bag_for_offline.py`).
+
+```bash
+python experiments/teleavatar_v2_deploy/server/bag_visualize_and_predict.py \
+  --bag <bag dir> --out <out dir> --task <your_task> \
+  --checkpoint runs/<task>/<RUN_ID>/checkpoints/weights/step_<N>.pt \
+  --dataset-stats runs/<task>/<RUN_ID>/dataset_stats.json \
+  --text-embed data/text_embeds_cache/<cache dir>/<sha256>.t5_len128.wan22ti2v5b.pt
+```
 
 | Script | What it answers | Runs the model |
 |---|---|---|
@@ -344,10 +410,11 @@ bash bench_latency_ws.sh <taskmap-key> 12     # specific task and step count
 bash bench_latency_ws.sh --sweep              # every served task × 8/10/12 steps
 ```
 
-The sweep asks the server which tasks it serves (`available_tasks` in the connection
-metadata), so it needs no task list of its own. Denoising steps are per-request — no restart
-needed — but start the server with `--warmup-steps 8 10 12` before comparing, so every CUDA
-Graph is warm.
+It connects to `HOST`/`PORT` (default `127.0.0.1`/`8000`) with `PYTHON_BIN` (default `python`
+on `PATH`). The sweep asks the server which tasks it serves (`available_tasks` in the
+connection metadata), so it needs no task list of its own. Denoising steps are per-request —
+no restart needed; `start_local_serve_ws.sh` already warms the CUDA Graphs for 8, 10 and 12
+steps (pass `--warmup-steps` yourself only when calling `serve_policy_ws.py` directly).
 
 ---
 

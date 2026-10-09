@@ -1,7 +1,12 @@
-# On the robot-side control machine (ROS 2 Humble system Python is fine)
+# On the robot-side control machine, into the system interpreter's user site:
+#   /usr/bin/python3 -m pip install --user -r requirements.txt
 numpy
 Pillow
 PyYAML
 requests
-opencv-python
+opencv-python<4.12        # 4.12+ needs numpy>=2; openpi-client needs numpy<2
+# WebSocket policy client (also pulls websockets, msgpack, dm-tree). openpi-client imports
+# typing_extensions without declaring it, so it is listed explicitly.
+openpi-client @ git+https://github.com/Physical-Intelligence/openpi.git#subdirectory=packages/openpi-client
+typing-extensions
 # ROS2 + GStreamer come from apt (rclpy, python3-gi, ...)

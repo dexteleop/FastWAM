@@ -253,11 +253,11 @@ def main() -> None:
         missing = exc.name or "unknown"
         logger.error(
             "Cannot import WebSocket client dependency %r with %s. Install with:\n"
-            "  %s -m pip install --user msgpack websockets msgpack-numpy "
-            "typing-extensions dm-tree",
+            "  %s -m pip install --user -r %s",
             missing,
             sys.executable,
             sys.executable,
+            Path(__file__).resolve().parent / "requirements.txt",
         )
         sys.exit(1)
 

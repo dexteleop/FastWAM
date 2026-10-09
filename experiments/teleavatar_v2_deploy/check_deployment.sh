@@ -26,7 +26,6 @@ FILES=(
     "client/run_client_ws.py"
     "client/fastwam_env.py"
     "client/run_task_ws.sh"
-    "server/serve_policy_ws.py"
     "../../docs/GUIDE.md"
 )
 
@@ -52,14 +51,16 @@ echo ""
 
 # Client Python dependencies
 echo "Checking Python dependencies..."
-DEPS=("websockets" "msgpack")
+# Import what run_client_ws.py imports: a bare `import openpi_client` succeeds even when
+# websocket_client_policy cannot load (it needs typing_extensions).
+DEPS=("websockets" "msgpack" "openpi_client.websocket_client_policy" "openpi_client.action_chunk_broker")
 MISSING_DEPS=0
 
 for dep in "${DEPS[@]}"; do
-    if python3 -c "import $dep" 2>/dev/null; then
+    if err="$(python3 -c "import $dep" 2>&1)"; then
         echo "  ✓ $dep"
     else
-        echo "  [x] not installed: $dep"
+        echo "  [x] cannot import $dep: $(echo "$err" | tail -1)"
         MISSING_DEPS=$((MISSING_DEPS + 1))
     fi
 done
@@ -67,7 +68,7 @@ done
 if [ $MISSING_DEPS -gt 0 ]; then
     echo ""
     echo "[!] $MISSING_DEPS dependency/dependencies missing"
-    echo "    pip install websockets msgpack-numpy typing-extensions dm-tree"
+    echo "    python3 -m pip install --user -r client/requirements.txt"
 else
     echo ""
     echo "[ok] all dependencies installed"

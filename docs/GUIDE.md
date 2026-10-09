@@ -158,7 +158,9 @@ re-running skips completed files.
 advertises the source resolution and LeRobot reads the wrong geometry.
 
 > Do not delete `data/*_lowres` after producing `_mono`: the mono directories symlink their
-> `meta/` and `data/` (the parquet files) back into the lowres copy. Only its `videos/` is
+> `data/` (the parquet files) back into the lowres copy, which in turn links to the source.
+> `meta/` starts as a symlink too; `patch_transcoded_meta.py` replaces it with a real copy
+> before writing, so the source `info.json` is never modified. Only lowres `videos/` is
 > redundant.
 
 ### 2. Two config files
@@ -378,7 +380,7 @@ Weights (`weights/step_<N>.pt`, ~12 GB) are never pruned — only optimizer stat
 | `checkpoints/ActionDiT_*.pt` | 2 G | no | same |
 | T5 encoder safetensors | 11 G | no | only with `--load-text-encoder` |
 
-About 13.4 GiB, not 33 — skipping those 32 GB is the point of the design.
+About 13.4 GB, not 33 — skipping those 32 GB is the point of the design.
 
 **`dataset_stats.json` must come from the same run as the weights.** Two runs with matching
 dimensions but different statistics load without complaint and produce subtly wrong actions.
@@ -428,8 +430,11 @@ The split is not a preference. ROS 2 Humble's C extensions are built for the sys
 interpreter (3.10); conda's python cannot import `rclpy` or `gi`. `rclpy` comes from
 `setup.bash`'s `PYTHONPATH`, not from dist-packages, so sourcing it is required.
 
-Robot-host dependencies (`openpi_client`, `websockets`, `msgpack`) go in that interpreter's
-user site — see `experiments/teleavatar_v2_deploy/client/requirements.txt`. GStreamer needs
+Robot-host dependencies (`openpi_client`, `websockets`, `msgpack`, `typing_extensions`) go in
+that interpreter's user site:
+`/usr/bin/python3 -m pip install --user -r experiments/teleavatar_v2_deploy/client/requirements.txt`
+(`openpi-client` is installed from the openpi GitHub repo; it imports `typing_extensions`
+without declaring it). GStreamer needs
 the H.265 decoder plugin (`gst-inspect-1.0 nvh265dec`).
 
 Pre-flight check: `bash experiments/teleavatar_v2_deploy/check_deployment.sh`.
@@ -536,15 +541,26 @@ The `/fastwam/policy/*` topics are what make predicted-vs-commanded-vs-measured 
 possible; without them a bag only supports commanded-vs-measured.
 
 ```bash
-python experiments/teleavatar_v2_deploy/server/analyze_deploy_bag.py <bag dir>
-python experiments/teleavatar_v2_deploy/server/joint_error_report.py <bag dir>
+python experiments/teleavatar_v2_deploy/server/analyze_deploy_bag.py --bag <bag dir> --out <out dir>
+python experiments/teleavatar_v2_deploy/server/joint_error_report.py --bag <bag dir> --out <out dir>
 
 # re-run the policy over a recorded bag (needs a checkpoint)
 python experiments/teleavatar_v2_deploy/server/bag_visualize_and_predict.py \
   --task <your_task> \
   --checkpoint runs/<task>/<RUN_ID>/checkpoints/weights/step_<N>.pt \
   --dataset-stats runs/<task>/<RUN_ID>/dataset_stats.json \
-  <bag dir>
+  --text-embed data/text_embeds_cache/<cache dir>/<sha256>.t5_len128.wan22ti2v5b.pt \
+  --bag <bag dir> --out <out dir>
+```
+
+Without `--out` every bag tool writes next to the bag. `--text-embed` is needed when the
+datasets are not on this host (otherwise the instruction is read from `meta/tasks.jsonl`).
+
+```bash
+# replay the export/ directory written by the command above
+python experiments/teleavatar_v2_deploy/server/offline_infer_from_export.py \
+  --export <out dir>/export --out <out dir 2> --task <your_task> \
+  --checkpoint ... --dataset-stats ... --text-embed ... --start 1000 --max-samples 2
 ```
 
 `offline_infer_from_export.py` replays exported frames without a robot;
@@ -562,8 +578,11 @@ The sweep reads `available_tasks` from the server's connection metadata, so it n
 list of its own. Denoising steps are per-request and need no restart, but start the server
 with `--warmup-steps 8 10 12` before comparing values so every CUDA Graph is warm.
 
-`bench_infer_ws.py` drives the same `openpi_client` stack the real client uses, with synthetic
-frames and no ROS 2 — nothing moves.
+`bench_infer_ws.py` uses the same msgpack wire format as the real client (raw `websockets`
+plus `openpi_client.msgpack_numpy`, falling back to a vendored copy), with synthetic frames and
+no ROS 2 — nothing moves. It does not import `openpi_client.websocket_client_policy`, so a
+passing bench does not prove the client stack is installed; `test_websocket_connection.py`
+does.
 
 ---
 
@@ -571,14 +590,14 @@ frames and no ROS 2 — nothing moves.
 
 | Symptom | Check | Cause / fix |
 |---|---|---|
-| Canvas size in the startup log is unexpected | first server log line | task config points at the wrong data config — stop before moving anything |
+| Canvas size in the startup log is unexpected | `TA2 mosaic geometry from config: canvas=...` in the server log | task config points at the wrong data config — stop before moving anything |
 | `Cannot reach policy server` | `curl http://<ip>:8000/healthz` | server down, firewall, or `--host` left at `127.0.0.1` |
 | `ModuleNotFoundError: websockets` | which interpreter | client must run on system `python3`, not conda |
 | `ROS2 interface not initialized` | `ros2 topic list` | ROS bridge not running, or `ROS_DOMAIN_ID` mismatch |
-| `Timeout waiting for sensor data` | `ros2 topic hz /left_arm/joint_states`, `gst-inspect-1.0 nvh265dec` | RTP not arriving on 8890, or GStreamer plugin missing |
+| `Timeout waiting for initial sensors` / `Failed to receive initial sensor data` | `ros2 topic hz /left_arm/joint_states`, `gst-inspect-1.0 nvh265dec` | RTP not arriving on 8890, or GStreamer plugin missing |
 | Action dimension mismatch at load | — | checkpoint, `dataset_stats.json` and task config must all come from the same run |
 | Server cannot find the VAE | `ls checkpoints/DiffSynth-Studio/Wan-Series-Converted-Safetensors/` | the VAE is not inside the `.pt`; copy it separately |
-| Task name rejected at startup | server log | the key is not in `taskmap.json` — regenerate it with `make_task_map.py` |
+| `Unknown task=...` on the first inference | server log / client error | the key is not in `taskmap.json` — regenerate it with `make_task_map.py` |
 | Training exits right after resuming | trainer warning | `additional_steps` not set |
 | Resumed run seems to repeat data | `trainer_state.json` | `batch_size` differs from the original run |
 | Text embedding not found | `ls data/text_embeds_cache/<task>/` | precompute step skipped, or instruction text changed |

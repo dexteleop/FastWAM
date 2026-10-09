@@ -69,6 +69,11 @@ cd "$CLIENT_DIR"
 source "$ROS_SETUP"
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-19}"
 
+# -h/--help only prints the client's options; do not start a recording for it.
+for arg in "$@"; do
+    [[ "$arg" == -h || "$arg" == --help ]] && exec "$PYTHON_BIN" run_client_ws.py --help
+done
+
 # Record decoded RTP frames (republished by ros2_interface), the policy's action chunks,
 # and robot state for the lifetime of this run. rosbag2 writes a directory under BAG_ROOT.
 # The /fastwam/policy/* pair is what analyze_deploy_bag.py needs for its
@@ -86,15 +91,22 @@ ros2 bag record -o "$BAG_ROOT/$BAG_NAME" \
   /left_gripper/joint_states /right_gripper/joint_states \
   /left_arm/current_ee_pose /right_arm/current_ee_pose \
   /api/left_arm/joint_cmd /api/right_arm/joint_cmd \
-  /api/left_gripper/cmd /api/right_gripper/cmd /api/fsm/enable \
+  /api/left_gripper/cmd /api/right_gripper/cmd /api/fsm/enable /api/servo/cmd \
   >"$BAG_ROOT/${BAG_NAME}.log" 2>&1 &
 BAG_PID=$!
 trap 'kill -INT "$BAG_PID" 2>/dev/null || true; wait "$BAG_PID" 2>/dev/null || true; echo "Rosbag saved: $BAG_ROOT/$BAG_NAME"' EXIT
+# Turn INT/TERM into a normal exit so the EXIT trap above stops the recorder. Ctrl-C also
+# reaches the client directly (same foreground process group); bash runs this trap once
+# the client has finished its own shutdown.
+trap 'exit 130' INT
+trap 'exit 143' TERM
 sleep 1
 
 # openpi_client / websockets / msgpack are expected in this interpreter's user site
 # (pip install --user), since conda's python cannot import rclpy.
-exec "$PYTHON_BIN" -u run_client_ws.py \
+# Not `exec`: exec would replace this shell and drop the EXIT trap, leaving
+# `ros2 bag record` running after the client exits.
+"$PYTHON_BIN" -u run_client_ws.py \
   --server-host "$SERVER_HOST" \
   --server-port "$SERVER_PORT" \
   "${TASK_ARGS[@]}" \

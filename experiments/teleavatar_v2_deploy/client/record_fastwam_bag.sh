@@ -42,4 +42,5 @@ ros2 bag record -o "${BAG_NAME}" \
   /api/right_arm/joint_cmd \
   /api/left_gripper/cmd \
   /api/right_gripper/cmd \
-  /api/fsm/enable
+  /api/fsm/enable \
+  /api/servo/cmd

@@ -26,9 +26,9 @@ def test_connection(host: str, port: int) -> bool:
             from openpi_client import websocket_client_policy
             from openpi_client import msgpack_numpy
             logger.info("[ok] openpi_client available")
-        except ImportError:
-            logger.error("[x] openpi_client not installed")
-            logger.error("    pip install websockets msgpack-numpy typing-extensions dm-tree")
+        except ImportError as e:
+            logger.error(f"[x] cannot import openpi_client: {e}")
+            logger.error("    python3 -m pip install --user -r experiments/teleavatar_v2_deploy/client/requirements.txt")
             return False
 
         logger.info(f"connecting to ws://{host}:{port} ...")
