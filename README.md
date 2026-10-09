@@ -79,6 +79,13 @@ pip install -e .
 pip install -e ".[analysis]"   # optional: the rosbag / plotting tools under Analysis tools
 ```
 
+Recent conda refuses `conda create` on the default Anaconda channels until their Terms of
+Service are accepted (`CondaToSNonInteractiveError`). Accept them as the error message
+describes, or create the env from conda-forge instead:
+`conda create -n fastwam -c conda-forge --override-channels python=3.10 -y`. If PyPI is slow
+from your network, a PyPI mirror (`pip install -i <mirror> ...`) works for everything except
+the torch line, which needs the PyTorch index.
+
 System tools: `ffmpeg`/`ffprobe` with libx264 (transcoding) and `tmux` (`launch_train.sh`).
 Training also needs `nvcc`: DeepSpeed checks the CUDA toolkit version on import and
 `accelerate launch` fails with `MissingCUDAException: CUDA_HOME does not exist` without it.
@@ -89,9 +96,24 @@ enough; `conda activate` puts it on `PATH`.
 
 Training needs the Wan2.2 base weights under `checkpoints/` (≈32 GB); a deploy-only machine
 needs just the VAE (see [Moving checkpoints](#moving-checkpoints-between-machines)).
-Missing files are downloaded automatically on first use, from ModelScope by default
-(`DIFFSYNTH_DOWNLOAD_SOURCE=huggingface` to switch, `DIFFSYNTH_SKIP_DOWNLOAD=true` to forbid
-it). If you already have them, place them like this — the directory names are load-bearing:
+Missing files are downloaded automatically from ModelScope on first use: the preprocess step
+below pulls the DiT and VAE, the text-embedding precompute pulls T5 and the tokenizer. Budget
+up to an hour for the first ≈32 GB (single streams ran at 4–25 MB/s in our runs). Partial
+files sit in `._____temp/` until complete; that directory and `.msc`/`.mv` are ModelScope
+bookkeeping. Once the files are present nothing touches the network.
+`DIFFSYNTH_SKIP_DOWNLOAD=true` forbids downloading; a missing file then surfaces later as
+`Cannot detect model type ... File: []`.
+
+Hugging Face: `DIFFSYNTH_DOWNLOAD_SOURCE=huggingface` on its own fails at the first file with
+`RepositoryNotFoundError: 401`, because the converted VAE/T5 come from
+`DiffSynth-Studio/Wan-Series-Converted-Safetensors`, which exists only on ModelScope. Also
+set `redirect_common_files: false` in the model config (`configs/model/fastwam.yaml`) to load
+the original `Wan2.2_VAE.pth` (fp32; identical to the converted file after the bf16 cast) and
+`models_t5_umt5-xxl-enc-bf16.pth` from `Wan-AI/Wan2.2-TI2V-5B` instead; both then live
+under `checkpoints/Wan-AI/Wan2.2-TI2V-5B/`, so copy that VAE path when
+[moving checkpoints](#moving-checkpoints-between-machines).
+
+If you already have the files, place them like this — the directory names are load-bearing:
 
 ```
 checkpoints/
@@ -215,13 +237,13 @@ without it.
 |---|---|---|
 | `ZERO` | `1` | DeepSpeed stage, 1 or 2 |
 | `NPROC` | `8` | GPUs per node |
-| `KEEP` | `2` | ZeRO state snapshots to retain |
+| `KEEP` | `2` | ZeRO state snapshots to retain (with `1`, the previous one is deleted while the next is still being written) |
 | `SESSION` | `fastwam_<task>` | tmux session name |
 | `CONDA_ENV` | `fastwam` | conda env to activate (name or path) |
 | `DRY_RUN` | — | print the command, start nothing |
 
-Before committing GPUs, check that the data loads (a few seconds, < 1 GB RAM; the
-normalization stats it computes go to a temporary directory):
+Before committing GPUs, check that the data loads (under a minute, ~2 GB RSS; it needs the
+text embeddings from step 3; the normalization stats it computes go to a temporary directory):
 
 ```bash
 python - <<'EOF'
@@ -245,7 +267,8 @@ template with `lift=off`.
 Any extra argument is passed through to hydra, so resume and LR-anneal need no new config file:
 
 ```bash
-# resume full state (weights + Adam momentum + LR schedule + dataloader cursor + RNG)
+# resume full state (weights + Adam momentum + LR schedule + dataloader cursor + RNG);
+# repeat the original run's overrides, and see below for additional_steps
 bash scripts/launch_train.sh <your_task> \
   resume=./runs/<your_task>/<RUN_ID>/checkpoints/state/step_<N> \
   additional_steps=<M>
@@ -260,8 +283,21 @@ bash scripts/launch_train.sh <your_task> \
 ZERO=2 NPROC=4 bash scripts/launch_train.sh <your_task>
 ```
 
-Two things that bite:
+Checkpoint directories are zero-padded: `state/step_000600`, `weights/step_000600.pt`.
 
+Things that bite:
+
+- **A resume is the original command plus `resume=`.** Pass the same overrides as the run
+  you resume (`max_steps=`, `batch_size=`, ...). If the warmup (5% of `max_steps`) rounds to
+  zero in one run but not the other, the scheduler is rebuilt as the wrong type: `KeyError:
+  '_schedulers'` in one direction, a silently different LR curve in the other.
+- **`additional_steps` extends the step budget, not the LR curve.** `max_steps` becomes
+  `N + M`, but the stored cosine keeps its original length; past the original end it climbs
+  back up (1e-6 → 2.6e-5 two steps past the end of a test run). To pick up after a crash,
+  leave it out (the unchanged config gives back the original `max_steps`) or set it to exactly
+  the remaining steps. To train longer, use the LR-anneal form. A resume with nothing left to
+  do warns `training will exit immediately`, but still writes a full state (~80 GB) and weights
+  file into the new run directory.
 - **`batch_size` must match the run you resume.** The sampler stores `batch_in_epoch`
   (a batch count, not a sample count), so changing `batch_size` silently resumes from the
   wrong position in the epoch. No error, no crash.

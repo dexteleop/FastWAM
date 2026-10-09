@@ -263,11 +263,13 @@ independent `lift_in_action` / `lift_in_state` flags, or the config group.
 
 ## Resume, fine-tune and LR anneal
 
-Training and resuming share one command; only config fields differ.
+Training and resuming share one command; only config fields differ. Repeat the original
+run's overrides (`max_steps=`, `batch_size=`, ...) and add the fields below. Step directories
+are zero-padded (`state/step_000600`).
 
 | Goal | `resume` | `resume_reinit_lr` | `additional_steps` |
 |---|---|---|---|
-| Crash recovery (continue the LR curve) | directory `state/step_<N>` | `false` | required |
+| Crash recovery (continue the LR curve) | directory `state/step_<N>` | `false` | omit, or exactly the remaining steps |
 | LR anneal to finish | directory `state/step_<N>` | `true` | required (raises if absent) |
 | Fine-tune on new data | file `weights/step_<N>.pt` | ignored | ignored |
 
@@ -284,19 +286,34 @@ bash scripts/launch_train.sh <your_task> \
   additional_steps=<M>
 ```
 
-### Two fields that fail quietly
+### Fields that fail quietly
 
-**`additional_steps` is required, or training exits immediately.** The trainer computes
-`max_steps = global_step + additional_steps`. Leave it null and, if the `num_epochs`-derived
-`max_steps` is already ≤ the current step, you get a **warning** and a clean exit — not an
-error:
+**`additional_steps` moves the end of training, not the end of the LR curve.** The trainer
+computes `max_steps = global_step + additional_steps` ("how many more steps", not an absolute
+target). Without it, `max_steps` is recomputed from the config exactly as in the original run
+(`trainer_state.json` does not store it), so an unchanged command resumes to the original end.
+
+With `resume_reinit_lr: false` the scheduler comes back from the state with its original
+length. Steps past the original `max_steps` therefore follow the cosine back **up**: on a
+6-step test run the LR went 1e-6 → 7.6e-6 → 2.6e-5 for steps 7 and 8. To train longer, rebuild
+the curve with `resume_reinit_lr=true` (see the anneal section below).
+
+If there is nothing left to do (`max_steps` ≤ the current step) you get a **warning**, not an
+error, and the run still saves a full state (~80 GB) and weights file into its new run
+directory before exiting:
 
 ```
 Resumed at global_step=<N> with max_steps=<M>; training will exit immediately.
 Set additional_steps=N or a larger max_steps to continue.
 ```
 
-So the value is "how many more steps", not an absolute target.
+**The scheduler type comes from the current command, the scheduler state from the
+checkpoint.** `_build_scheduler` uses `SequentialLR` (warmup + cosine) when
+`int(max_steps * 0.05) > 0` and a bare `CosineAnnealingLR` otherwise. If the resumed command
+lands on the other side of that line from the original (in practice: short runs, or a
+`max_steps=` override that was not repeated), the types differ. Original without warmup,
+resume with: `KeyError: '_schedulers'`. The other way round loads without complaint and
+the bare cosine runs with the new command's `T_max`.
 
 **Changing `batch_size` silently replays data.** The sampler computes:
 
@@ -358,7 +375,8 @@ grep -E "^(resume|resume_reinit_lr|additional_steps|resume_warmup_frac|learning_
 
 Each `state/step_<N>/` is ~80 GB. `launch_train.sh` starts `scripts/prune_states.py --watch`
 alongside training, keeping the newest `KEEP` (default 2). Run it manually if you started
-training without the wrapper.
+training without the wrapper. The newest state counts toward `KEEP` while it is still being
+written, so with `KEEP=1` the last complete state is gone before the next one is finished.
 
 Weights (`weights/step_<N>.pt`, ~12 GB) are never pruned — only optimizer state is.
 
@@ -598,6 +616,8 @@ does.
 | Action dimension mismatch at load | — | checkpoint, `dataset_stats.json` and task config must all come from the same run |
 | Server cannot find the VAE | `ls checkpoints/DiffSynth-Studio/Wan-Series-Converted-Safetensors/` | the VAE is not inside the `.pt`; copy it separately |
 | `Unknown task=...` on the first inference | server log / client error | the key is not in `taskmap.json` — regenerate it with `make_task_map.py` |
-| Training exits right after resuming | trainer warning | `additional_steps` not set |
+| Training exits right after resuming | trainer warning | `max_steps` ≤ the resumed step: add `additional_steps` (with `resume_reinit_lr=true` to go past the original end) |
+| `KeyError: '_schedulers'` when resuming | traceback in `accelerator.load_state` | the resumed command's step count differs from the original run's; repeat its overrides |
+| LR rises after resuming | `lr=` in the train log | resumed past the original `max_steps` with `resume_reinit_lr=false` |
 | Resumed run seems to repeat data | `trainer_state.json` | `batch_size` differs from the original run |
 | Text embedding not found | `ls data/text_embeds_cache/<task>/` | precompute step skipped, or instruction text changed |

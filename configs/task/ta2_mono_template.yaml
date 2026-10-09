@@ -61,7 +61,8 @@ max_steps: null
 #     additional_steps=<M>
 resume: null
 resume_reinit_lr: false     # true rebuilds the LR curve (anneal); false keeps the stored schedule
-additional_steps: null      # required when resuming: max_steps becomes global_step + this
+additional_steps: null      # on resume, max_steps becomes global_step + this; omit for crash recovery
+                            # (the LR curve keeps its original length -- see docs/GUIDE.md)
 
 log_every: 10
 save_every: 4000
