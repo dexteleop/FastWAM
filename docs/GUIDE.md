@@ -1,15 +1,17 @@
 # FastWAM TA2 — Training & Deployment Guide
 
-Reference for the details [README.md](../README.md) only summarises. Nothing here is tied to a
-particular dataset or task.
+Reference for the details [README.md](../README.md) only summarises: the README is the happy
+path, one command per step; this file is where each command's variants, semantics and failure
+modes are spelled out once. Nothing here is tied to a particular dataset or task.
 
 - [Part 1 — Training](#part-1--training)
+  - [Base weights and download sources](#base-weights-and-download-sources)
   - [The config chain](#the-config-chain)
   - [Launching](#launching)
   - [Onboarding a new dataset](#onboarding-a-new-dataset)
   - [The lifting column](#the-lifting-column-liftoffon)
   - [Resume, fine-tune and LR anneal](#resume-fine-tune-and-lr-anneal)
-  - [Checkpoint management and transfer](#checkpoint-management-and-transfer)
+  - [Pruning ZeRO state](#pruning-zero-state)
   - [Monitoring](#monitoring)
 - [Part 2 — Deployment](#part-2--deployment)
   - [Two machines, two interpreters](#two-machines-two-interpreters)
@@ -23,6 +25,24 @@ particular dataset or task.
 ---
 
 # Part 1 — Training
+
+## Base weights and download sources
+
+The README's [Base weights](../README.md#base-weights) section gives the directory tree,
+the ModelScope auto-download and the ActionDiT preprocess command. This section covers the
+alternative download route.
+
+Hugging Face: `DIFFSYNTH_DOWNLOAD_SOURCE=huggingface` on its own fails at the first file with
+`RepositoryNotFoundError: 401`, because the converted VAE/T5 come from
+`DiffSynth-Studio/Wan-Series-Converted-Safetensors`, which exists only on ModelScope. Also
+set `redirect_common_files: false` in the model config (`configs/model/fastwam.yaml`) to load
+the original `Wan2.2_VAE.pth` (fp32; identical to the converted file after the bf16 cast) and
+`models_t5_umt5-xxl-enc-bf16.pth` from `Wan-AI/Wan2.2-TI2V-5B` instead; both then live
+under `checkpoints/Wan-AI/Wan2.2-TI2V-5B/`, so copy that VAE path when
+[moving checkpoints](../README.md#step-6-move-the-checkpoint-to-the-deploy-host).
+
+Either way, `DIFFSYNTH_SKIP_DOWNLOAD=true` forbids downloading, and a missing file then
+surfaces later as `Cannot detect model type ... File: []`.
 
 ## The config chain
 
@@ -78,6 +98,13 @@ directory, which breaks every `./data/...` relative path in the configs.
 Change `train.yaml` only for things that should affect **all** tasks. Task-specific values
 belong in the task config.
 
+### How `max_steps` is derived
+
+`max_steps` is derived when left `null`:
+`steps/epoch = ceil(ceil(len(dataset) / (batch_size × n_gpu)) / grad_accum)`,
+and `len(dataset)` is the **frame count**. Sliding windows overlap heavily, so "one epoch"
+is not "every independent sample once".
+
 ## Launching
 
 ```bash
@@ -85,16 +112,9 @@ bash scripts/launch_train.sh <your_task>
 ```
 
 Starts a tmux session with two windows: `train` and `prune`. The second is **not optional** —
-each ZeRO state snapshot is ~80 GB and will fill the disk without it.
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `ZERO` | 1 | DeepSpeed stage (1 or 2) |
-| `NPROC` | 8 | GPUs per node |
-| `KEEP` | 2 | state snapshots to retain |
-| `SESSION` | `fastwam_<task>` | tmux session name |
-| `CONDA_SH` / `CONDA_ENV` | `~/miniconda3/...` / `fastwam` | conda activation |
-| `DRY_RUN` | — | print the command, start nothing |
+each ZeRO state snapshot is ~80 GB and will fill the disk without it. The environment
+variables it reads (`ZERO`, `NPROC`, `KEEP`, `SESSION`, `CONDA_SH`, `CONDA_ENV`, `DRY_RUN`)
+are tabulated in the README under [Step 5](../README.md#step-5-launch-training).
 
 Beyond the launcher, it pre-checks that the task config exists and starts with
 `# @package _global_`, validates `lift=`, verifies wandb credentials when wandb is enabled,
@@ -227,7 +247,9 @@ bash scripts/launch_train.sh <your_task> lift=off    # 16-d instead
 ```
 
 **`lift=on` puts the lift command in the action, never the measured velocity in the
-state.** The deploy interface (dev docs §4.8) has no lift state topic, so on the robot that
+state.** The deploy interface
+([TeleAvatar 2.0 developer docs](https://www.dexteleop.com/docs/teleavatar-2), §4.8 state
+feedback) has no lift state topic, so on the robot that
 channel can only be filled with 0. In the training data it tracks the command with a lag-0
 correlation of 0.9978, so a model given it copies it instead of looking at the images. At
 deploy time the constant 0 normalizes to −0.0604, next to the −0.0584 of a stationary column
@@ -369,50 +391,16 @@ grep -E "^(resume|resume_reinit_lr|additional_steps|resume_warmup_frac|learning_
   runs/<task>/<RUN_ID>/config.yaml
 ```
 
-## Checkpoint management and transfer
-
-### Pruning ZeRO state
+## Pruning ZeRO state
 
 Each `state/step_<N>/` is ~80 GB. `launch_train.sh` starts `scripts/prune_states.py --watch`
 alongside training, keeping the newest `KEEP` (default 2). Run it manually if you started
 training without the wrapper. The newest state counts toward `KEEP` while it is still being
 written, so with `KEEP=1` the last complete state is gone before the next one is finished.
 
-Weights (`weights/step_<N>.pt`, ~12 GB) are never pruned — only optimizer state is.
-
-### A checkpoint is not self-contained
-
-`save_checkpoint` stores only two things: `mot` and `proprio_encoder`. **The VAE is not in the
-`.pt` file** and loads separately.
-
-| File | Size | Needed | Why |
-|---|---|---|---|
-| `runs/<task>/<RUN_ID>/checkpoints/weights/step_<N>.pt` | 12 G | yes | mot + proprio_encoder |
-| `runs/<task>/<RUN_ID>/dataset_stats.json` | ~100 K | yes | action/state denormalization |
-| `configs/{train,task,data,model}` | small | yes | serving recomposes via hydra from `task=` |
-| `data/text_embeds_cache/<task>/` | ~1 M | yes | precomputed T5 context |
-| `checkpoints/DiffSynth-Studio/Wan-Series-Converted-Safetensors/Wan2.2_VAE.safetensors` | 1.4 G | **yes** | absent from the `.pt` |
-| `taskmap.json` | <1 K | optional | only for selecting instructions by name |
-| `runs/<task>/<RUN_ID>/config.yaml` | small | optional | provenance; serving does not read it |
-| `checkpoints/Wan-AI/Wan2.2-TI2V-5B/*.safetensors` | 19 G | no | `skip_dit_load_from_pretrain=True` |
-| `checkpoints/ActionDiT_*.pt` | 2 G | no | same |
-| T5 encoder safetensors | 11 G | no | only with `--load-text-encoder` |
-
-About 13.4 GB, not 33 — skipping those 32 GB is the point of the design.
-
-**`dataset_stats.json` must come from the same run as the weights.** Two runs with matching
-dimensions but different statistics load without complaint and produce subtly wrong actions.
-Vector widths are validated; the values are not.
-
-### Transfer
-
-Any file-transfer tool works; keep the repo-relative paths (`runs/<task>/<RUN_ID>/...`,
-`data/text_embeds_cache/<task>/`) so the deploy scripts find everything without extra
-variables. See the README's [Moving checkpoints between machines](../README.md#moving-checkpoints-between-machines)
-for an `rsync -R` example.
-
-Datasets travel the same way. Copy each `*_lowres` directory together with its `*_mono`
-one: the mono copy symlinks `meta/` and `data/` back into it.
+Weights (`weights/step_<N>.pt`, ~12 GB) are never pruned — only optimizer state is. Which
+files must leave the training host together, and how to copy them, is a deployment question:
+[What a deploy machine actually needs](#what-a-deploy-machine-actually-needs).
 
 ## Monitoring
 
@@ -455,12 +443,40 @@ that interpreter's user site:
 without declaring it). GStreamer needs
 the H.265 decoder plugin (`gst-inspect-1.0 nvh265dec`).
 
-Pre-flight check: `bash experiments/teleavatar_v2_deploy/check_deployment.sh`.
+Pre-flight check: `bash experiments/teleavatar_v2_deploy/check_deployment.sh`. It verifies
+the deploy files are present and imports what `run_client_ws.py` imports
+(`openpi_client.websocket_client_policy`, not just `openpi_client`). It does not exercise the
+link to the server;
+`/usr/bin/python3 experiments/teleavatar_v2_deploy/test_websocket_connection.py --host <gpu-host>`
+does.
 
 ## What a deploy machine actually needs
 
-`serve_policy.py` resolves everything relative to `PROJECT_ROOT`, and the intermediate
-directory names are load-bearing:
+`save_checkpoint` stores only two things: `mot` and `proprio_encoder`. **The VAE is not in the
+`.pt` file** and loads separately.
+
+| File | Size | Needed | Why |
+|---|---|---|---|
+| `runs/<task>/<RUN_ID>/checkpoints/weights/step_<N>.pt` | 12 G | yes | mot + proprio_encoder |
+| `runs/<task>/<RUN_ID>/dataset_stats.json` | ~100 K | yes | action/state denormalization |
+| `configs/{train,task,data,model}` | small | yes | serving recomposes via hydra from `task=` |
+| `data/text_embeds_cache/<task>/` | ~1 M | yes | precomputed T5 context |
+| `checkpoints/DiffSynth-Studio/Wan-Series-Converted-Safetensors/Wan2.2_VAE.safetensors` | 1.4 G | **yes** | absent from the `.pt` |
+| `taskmap.json` | <1 K | optional | only for selecting instructions by name |
+| `runs/<task>/<RUN_ID>/config.yaml` | small | optional | provenance; serving does not read it |
+| `checkpoints/Wan-AI/Wan2.2-TI2V-5B/*.safetensors` | 19 G | no | `skip_dit_load_from_pretrain=True` |
+| `checkpoints/ActionDiT_*.pt` | 2 G | no | same |
+| T5 encoder safetensors | 11 G | no | only with `--load-text-encoder` |
+
+About 13.4 GB, not 33 — skipping those 32 GB is the point of the design.
+
+**`dataset_stats.json` must come from the same run as the weights.** Two runs with matching
+dimensions but different statistics load without complaint and produce subtly wrong actions.
+Vector widths are validated; the values are not.
+
+The server (`serve_policy_ws.py`, which loads the policy from `serve_policy.py`) resolves
+everything relative to the repo root it is installed in (derived from its own file location,
+not from the `PROJECT_ROOT` variable), and the intermediate directory names are load-bearing:
 
 ```
 runs/<task>/<RUN_ID>/checkpoints/weights/step_<N>.pt
@@ -476,53 +492,72 @@ checkpoints/DiffSynth-Studio/Wan-Series-Converted-Safetensors/Wan2.2_VAE.safeten
 `DIFFSYNTH_MODEL_BASE_PATH` points at `checkpoints/`; the loader appends the
 `DiffSynth-Studio/...` path itself, so none of those directory names may be renamed.
 
+Any file-transfer tool works; keep the repo-relative paths (`runs/<task>/<RUN_ID>/...`,
+`data/text_embeds_cache/<task>/`) so the deploy scripts find everything without extra
+variables. See the README's [Step 6](../README.md#step-6-move-the-checkpoint-to-the-deploy-host)
+for an `rsync -R` example.
+
+Datasets travel the same way. Copy each `*_lowres` directory together with its `*_mono`
+one: the mono copy symlinks `data/` back into it (`meta/` is a real copy once
+`patch_transcoded_meta.py` has run).
+
 ## Startup order
 
-**1. GPU host — start the server**
+The commands are in the README ([Step 7](../README.md#step-7-start-the-server-gpu-host) and
+[Step 8](../README.md#step-8-start-the-client-robot-host)); this is the order they must run
+in, and what each wrapper reads from the environment.
 
-```bash
-TASK=<your_task> bash start_local_serve_ws.sh 10      # 10 = denoising steps
-```
+**1. GPU host — start the server.** `TASK=<your_task> bash start_local_serve_ws.sh 10`
+(`10` = denoising steps). `TASK` must name the config the checkpoint was **trained** with:
+hydra recomposes the data and model dimensions from it, so a mismatch fails at load. The
+model loads first (~2 min); wait for `WebSocket server listening on ws://0.0.0.0:8000`.
 
-`RUN` and `STEP` default to the newest run and highest step; override to pin a specific
-checkpoint, or pass `CHECKPOINT` / `DATASET_STATS` directly. Wait for
-`WebSocket server listening on ws://0.0.0.0:8000`.
+| Variable | Default | Meaning |
+|---|---|---|
+| `TASK` | required | config name under `configs/task/` (no `.yaml`); must be the one the checkpoint was trained with |
+| `RUN` | newest under `runs/$TASK` | run directory |
+| `STEP` | highest step in that run | filename under `weights/` |
+| `CHECKPOINT` | — | explicit weights path (overrides `RUN`/`STEP`) |
+| `DATASET_STATS` | `$RUN/dataset_stats.json` | explicit stats path |
+| `TASK_MAP` | `taskmap.json` | task library; skipped if absent (the server still runs, you just cannot switch instructions by name) |
+| `PROMPT_TASK` | resolved from the dataset meta | startup instruction |
+| `TEXT_EMBED` | — | precomputed T5 context `.pt` for the startup instruction; skips the lookup. Use it on a deploy machine that has the embeds but not the datasets |
+| `CONFIG_OVERRIDES` | — | space-separated hydra overrides, each passed as `--config-override`, e.g. `"lift=legacy"` for a pre-split 17/15 checkpoint |
+| `PROJECT_ROOT` | the script's directory | repo the wrapper `cd`s into; only needed when calling it from outside the repo. It does not relocate configs or caches — the server derives those from its own location |
+| `PYTHON_BIN` | `python` | interpreter (activate the env first) |
+| `HOST` / `PORT` | `0.0.0.0` / `8000` | listen address |
+| `CUDA_VISIBLE_DEVICES` | `0` | which GPU |
+| `DIFFSYNTH_MODEL_BASE_PATH` | `$PROJECT_ROOT/checkpoints` | where the VAE is found |
 
-`--task` must name the config the checkpoint was **trained** with: hydra recomposes the data
-and model dimensions from it, so a mismatch fails at load.
+The wrapper passes `--warmup-steps 8 10 12` itself, so CUDA Graphs for those step counts are
+warm before the first request.
 
-**2. Verify**
+**2. Verify.**
 
 ```bash
 curl http://<gpu-host>:8000/healthz      # expect OK
 ```
 
-**3. Optional — build a task library**
-
-```bash
-python experiments/teleavatar_v2_deploy/server/make_task_map.py \
-  --dataset-dir data/<your_dataset>_mono \
-  --cache-dir data/text_embeds_cache/<your_task> \
-  --out taskmap.json
-```
-
+**3. Optional — build a task library** with `make_task_map.py` (command in the README under
+[Optional: a task library](../README.md#optional-a-task-library-for-switching-instructions)).
 Keys derive from the dataset directory name; a dataset with several instructions gets one key
 per `task_index`. Override with `--instruction 'key=text'`. This file is generated per
 deployment and gitignored.
 
 **4. Robot host — ROS 2 up**, then zero the arms before handing control to the policy.
 
-**5. Robot host — start the client**
+**5. Robot host — start the client.** `./run_task_ws.sh <taskmap-key> --dry-run` first, then
+without `--dry-run`; omit the key to use the server's startup instruction. The script sources
+ROS 2, starts a rosbag recording, and runs `run_client_ws.py` on the system interpreter.
 
-```bash
-cd experiments/teleavatar_v2_deploy/client
-./run_task_ws.sh <taskmap-key> --dry-run     # infer only, nothing moves
-./run_task_ws.sh <taskmap-key>               # live
-./run_task_ws.sh                             # server's startup instruction
-```
-
-Useful variables: `SERVER_HOST` / `SERVER_PORT`, `BAG_ROOT`, `ROS_DOMAIN_ID`, `ROS_SETUP`,
-`PYTHON_BIN`.
+| Variable | Default | Meaning |
+|---|---|---|
+| `SERVER_HOST` / `SERVER_PORT` | `127.0.0.1` / `8000` | the GPU host |
+| `BAG_ROOT` | `$HOME/fastwam_bags` | where rosbag2 writes |
+| `ROS_DOMAIN_ID` | `19` | must match the robot's bridge |
+| `ROS_SETUP` | `/opt/ros/humble/setup.bash` | sourced before the client starts |
+| `PYTHON_BIN` | `/usr/bin/python3` | the client interpreter — see [Two machines, two interpreters](#two-machines-two-interpreters) |
+| `CLIENT_DIR` | the script's directory | directory holding `run_client_ws.py` |
 
 ## Safety
 
@@ -537,8 +572,10 @@ Useful variables: `SERVER_HOST` / `SERVER_PORT`, `BAG_ROOT`, `ROS_DOMAIN_ID`, `R
   `--open-loop-horizon` steps. Budget accordingly at 20 Hz.
 - **Lifting column (17-d policies).** The client takes the column over automatically when
   the server reports a lift channel, and republishes `/api/servo/cmd` at 20 Hz on its own
-  keep-alive timer. §4.6 requires ≥ 10 Hz, disables the servo after 3 s of silence, and does
-  not use the FSM heartbeat. On exit it sends `[0.0, 0.0]` before stopping the arms. On
+  keep-alive timer. The developer docs (§4.6, lift servo control) recommend ≥ 10 Hz while
+  moving; after more than 3 s without a command the servo decelerates and then disables
+  itself, and it does not use the FSM heartbeat. On exit the client sends `[0.0, 0.0]` (stop
+  and disable) before stopping the arms. On
   first power-up, run with `--lift-dry-run`, which logs the command without moving the
   column, then lower `lift.max_normalized_velocity` in `arm_config.yml` to confirm the
   direction. `--lift-mode off` never drives the column, even with a 17-d checkpoint.
@@ -558,6 +595,14 @@ does the same standalone.
 The `/fastwam/policy/*` topics are what make predicted-vs-commanded-vs-measured analysis
 possible; without them a bag only supports commanded-vs-measured.
 
+All tools live under `experiments/teleavatar_v2_deploy/server/`; run any of them with
+`--help` (the README's [Analysis tools](../README.md#analysis-tools) table says what each one
+answers). The bag tools take `--bag <bag dir>` and write next to the bag unless given `--out`.
+The ones that run the model need `--task` plus a matching `--checkpoint` / `--dataset-stats`
+pair from the same run, and on a machine without the datasets also `--text-embed` (as for the
+server; otherwise the instruction is read from `meta/tasks.jsonl`); the rest only read a bag
+or a stream.
+
 ```bash
 python experiments/teleavatar_v2_deploy/server/analyze_deploy_bag.py --bag <bag dir> --out <out dir>
 python experiments/teleavatar_v2_deploy/server/joint_error_report.py --bag <bag dir> --out <out dir>
@@ -571,8 +616,8 @@ python experiments/teleavatar_v2_deploy/server/bag_visualize_and_predict.py \
   --bag <bag dir> --out <out dir>
 ```
 
-Without `--out` every bag tool writes next to the bag. `--text-embed` is needed when the
-datasets are not on this host (otherwise the instruction is read from `meta/tasks.jsonl`).
+`offline_infer_from_export.py --export` takes the `export/` directory that
+`bag_visualize_and_predict.py` writes under its `--out` (or `client/export_bag_for_offline.py`):
 
 ```bash
 # replay the export/ directory written by the command above
@@ -592,9 +637,12 @@ bash bench_latency_ws.sh <taskmap-key> 12     # specific task and step count
 bash bench_latency_ws.sh --sweep              # every served task x 8/10/12 steps
 ```
 
-The sweep reads `available_tasks` from the server's connection metadata, so it needs no task
-list of its own. Denoising steps are per-request and need no restart, but start the server
-with `--warmup-steps 8 10 12` before comparing values so every CUDA Graph is warm.
+It connects to `HOST`/`PORT` (default `127.0.0.1`/`8000`) with `PYTHON_BIN` (default `python`
+on `PATH`). The sweep reads `available_tasks` from the server's connection metadata, so it
+needs no task list of its own. Denoising steps are per-request — no restart needed;
+`start_local_serve_ws.sh` already warms the CUDA Graphs for 8, 10 and 12 steps, so every
+value in the sweep is compared warm (pass `--warmup-steps` yourself only when calling
+`serve_policy_ws.py` directly).
 
 `bench_infer_ws.py` uses the same msgpack wire format as the real client (raw `websockets`
 plus `openpi_client.msgpack_numpy`, falling back to a vendored copy), with synthetic frames and
@@ -609,13 +657,16 @@ does.
 | Symptom | Check | Cause / fix |
 |---|---|---|
 | Canvas size in the startup log is unexpected | `TA2 mosaic geometry from config: canvas=...` in the server log | task config points at the wrong data config — stop before moving anything |
-| `Cannot reach policy server` | `curl http://<ip>:8000/healthz` | server down, firewall, or `--host` left at `127.0.0.1` |
+| `Cannot reach policy server` | the URL in the error; `curl http://<ip>:8000/healthz` | server down or still loading (~2 min); firewall; the client's `SERVER_HOST` left at its default `127.0.0.1` while the server runs on another machine; or the server started with `HOST=127.0.0.1` |
 | `ModuleNotFoundError: websockets` | which interpreter | client must run on system `python3`, not conda |
 | `ROS2 interface not initialized` | `ros2 topic list` | ROS bridge not running, or `ROS_DOMAIN_ID` mismatch |
 | `Timeout waiting for initial sensors` / `Failed to receive initial sensor data` | `ros2 topic hz /left_arm/joint_states`, `gst-inspect-1.0 nvh265dec` | RTP not arriving on 8890, or GStreamer plugin missing |
 | Action dimension mismatch at load | — | checkpoint, `dataset_stats.json` and task config must all come from the same run |
 | Server cannot find the VAE | `ls checkpoints/DiffSynth-Studio/Wan-Series-Converted-Safetensors/` | the VAE is not inside the `.pt`; copy it separately |
 | `Unknown task=...` on the first inference | server log / client error | the key is not in `taskmap.json` — regenerate it with `make_task_map.py` |
+| `MissingCUDAException: CUDA_HOME does not exist` at `accelerate launch` | `which nvcc` | no CUDA toolkit on the host — `conda install -y -c nvidia cuda-nvcc=12.8` into the env |
+| `RepositoryNotFoundError: 401` while downloading weights | `DIFFSYNTH_DOWNLOAD_SOURCE` | Hugging Face source needs `redirect_common_files: false` — see [Base weights and download sources](#base-weights-and-download-sources) |
+| `Cannot detect model type ... File: []` | `ls checkpoints/` against the README's tree | a base-weight file is missing — e.g. `DIFFSYNTH_SKIP_DOWNLOAD=true` forbade fetching it |
 | Training exits right after resuming | trainer warning | `max_steps` ≤ the resumed step: add `additional_steps` (with `resume_reinit_lr=true` to go past the original end) |
 | `KeyError: '_schedulers'` when resuming | traceback in `accelerator.load_state` | the resumed command's step count differs from the original run's; repeat its overrides |
 | LR rises after resuming | `lr=` in the train log | resumed past the original `max_steps` with `resume_reinit_lr=false` |
